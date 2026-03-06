@@ -1,599 +1,543 @@
-const express  = require('express');
-const cors     = require('cors');
-const axios    = require('axios');
-const crypto   = require('crypto');
+// ═══════════════════════════════════════════════════════════════════
+// ASCOVITA BACKEND — server.js
+// Node.js + Express + Supabase
+// Routes: Google OAuth · Products · Orders · Coupons · Cashfree
+//         Shiprocket · Instagram · Admin
+//
+// Deploy on: Render (ascovita-backend.onrender.com)
+//
+// ENV VARS REQUIRED (set in Render → Environment):
+//   SUPABASE_URL            your supabase project URL
+//   SUPABASE_SERVICE_KEY    supabase service role key (not anon key)
+//   GOOGLE_CLIENT_ID        6793142938-b9sl3d3lh2svjkmcnina8fsh31nut0bu.apps.googleusercontent.com
+//   GOOGLE_CLIENT_SECRET    your google oauth client secret
+//   JWT_SECRET              any long random string e.g. openssl rand -hex 32
+//   CASHFREE_APP_ID         your live cashfree app id
+//   CASHFREE_SECRET_KEY     your live cashfree secret key
+//   CASHFREE_ENV            PRODUCTION
+//   SHIPROCKET_EMAIL        your shiprocket login email
+//   SHIPROCKET_PASSWORD     your shiprocket login password
+//   INSTAGRAM_TOKEN         your instagram long-lived token
+//   RECAPTCHA_SECRET        your recaptcha v3 secret key
+//   FRONTEND_URL            https://yourusername.github.io
+//   SESSION_SECRET          any long random string
+// ═══════════════════════════════════════════════════════════════════
+
+'use strict';
+
+const express    = require('express');
+const cors       = require('cors');
+const fetch      = require('node-fetch');
+const jwt        = require('jsonwebtoken');
+const { createClient } = require('@supabase/supabase-js');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ─── CONFIG ───────────────────────────────────────────────
-const CF_APP_ID   = process.env.CASHFREE_APP_ID   || '';
-const CF_SECRET   = process.env.CASHFREE_SECRET   || process.env.CASHFREE_SECRET_KEY || '';
-const CF_ENV      = (process.env.CASHFREE_ENV     || 'PROD').replace(/"/g,'').toUpperCase();
-const SITE_URL    = process.env.SITE_URL          || 'https://darkblue-chimpanzee-556703.hostingersite.com';
+// ── Supabase client ──────────────────────────────────────────────
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
 
-// Supabase — URL hardcoded, keys from env (with fallback to publishable key)
-const SB_URL      = 'https://frwsjgrrtzhjfflcdjjs.supabase.co';
-const SB_ANON     = process.env.SUPABASE_KEY     || 'sb_publishable_hcaCblRtB3GzYihyF23W7w_X4kRAiIU';
-const SB_SERVICE  = process.env.SUPABASE_SERVICE || process.env.SUPABASE_SERVICE_KEY || SB_ANON;
+// ── CORS ─────────────────────────────────────────────────────────
+const ALLOWED_ORIGINS = [
+  process.env.FRONTEND_URL || 'https://yourusername.github.io',
+  'http://localhost:3000',
+  'http://127.0.0.1:5500',
+];
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin || ALLOWED_ORIGINS.some(o => origin.startsWith(o))) return cb(null, true);
+    cb(new Error('CORS: origin not allowed → ' + origin));
+  },
+  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+  credentials: true,
+}));
+app.options('*', cors());
+app.use(express.json({ limit: '2mb' }));
 
-const CF_BASE  = CF_ENV === 'PROD'
+// ── JWT helpers ──────────────────────────────────────────────────
+const JWT_SECRET = process.env.JWT_SECRET || 'change-me-in-production';
+
+function signToken(payload) {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: '30d' });
+}
+function verifyToken(token) {
+  try { return jwt.verify(token, JWT_SECRET); }
+  catch(e) { return null; }
+}
+function authMiddleware(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token  = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Unauthorised' });
+  const payload = verifyToken(token);
+  if (!payload) return res.status(401).json({ error: 'Invalid token' });
+  req.user = payload;
+  next();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// GOOGLE OAUTH
+// ═══════════════════════════════════════════════════════════════
+
+// POST /api/auth/google
+// Body: { credential } — the JWT id_token from Google frontend
+// Returns: { token, user }
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    const { credential } = req.body;
+    if (!credential) return res.status(400).json({ error: 'Missing credential' });
+
+    // Verify Google id_token
+    const googleRes = await fetch(
+      `https://oauth2.googleapis.com/tokeninfo?id_token=${credential}`
+    );
+    const googleData = await googleRes.json();
+
+    if (googleData.error || googleData.aud !== process.env.GOOGLE_CLIENT_ID) {
+      return res.status(401).json({ error: 'Invalid Google token' });
+    }
+
+    const { sub: googleId, email, name, picture } = googleData;
+
+    // Upsert user in Supabase
+    const { data: existing } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', email)
+      .single();
+
+    let user;
+    if (existing) {
+      // Update Google info if new
+      const { data: updated } = await supabase
+        .from('users')
+        .update({ google_id: googleId, picture, name, updated_at: new Date() })
+        .eq('email', email)
+        .select()
+        .single();
+      user = updated || existing;
+    } else {
+      // Create new user
+      const { data: created, error: createErr } = await supabase
+        .from('users')
+        .insert([{ email, name, picture, google_id: googleId, created_at: new Date() }])
+        .select()
+        .single();
+      if (createErr) throw createErr;
+      user = created;
+    }
+
+    const token = signToken({ id: user.id, email: user.email, name: user.name });
+    res.json({ token, user: { id: user.id, name: user.name, email: user.email, picture: user.picture, phone: user.phone || '' } });
+
+  } catch (err) {
+    console.error('Google auth error:', err);
+    res.status(500).json({ error: 'Authentication failed' });
+  }
+});
+
+// POST /api/auth/email-login
+// Body: { email, password }
+app.post('/api/auth/email-login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'Missing fields' });
+
+    const { data: user } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', email)
+      .single();
+
+    if (!user || user.password !== Buffer.from(password).toString('base64')) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    const token = signToken({ id: user.id, email: user.email, name: user.name });
+    res.json({ token, user: { id: user.id, name: user.name, email: user.email, picture: user.picture || '', phone: user.phone || '' } });
+  } catch (err) {
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// POST /api/auth/register
+// Body: { name, email, password, phone }
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { name, email, password, phone } = req.body;
+    if (!name || !email || !password) return res.status(400).json({ error: 'Missing fields' });
+
+    const { data: existing } = await supabase.from('users').select('id').eq('email', email).single();
+    if (existing) return res.status(409).json({ error: 'Email already registered' });
+
+    const { data: user, error } = await supabase
+      .from('users')
+      .insert([{ name, email, phone, password: Buffer.from(password).toString('base64'), created_at: new Date() }])
+      .select()
+      .single();
+    if (error) throw error;
+
+    const token = signToken({ id: user.id, email: user.email, name: user.name });
+    res.json({ token, user: { id: user.id, name: user.name, email: user.email, phone: user.phone || '' } });
+  } catch (err) {
+    res.status(500).json({ error: 'Registration failed' });
+  }
+});
+
+// GET /api/auth/me — get profile for logged-in user
+app.get('/api/auth/me', authMiddleware, async (req, res) => {
+  const { data: user } = await supabase.from('users').select('id,name,email,phone,picture,address').eq('id', req.user.id).single();
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  res.json(user);
+});
+
+// PUT /api/auth/profile — update profile
+app.put('/api/auth/profile', authMiddleware, async (req, res) => {
+  try {
+    const { name, phone, address } = req.body;
+    const { data, error } = await supabase
+      .from('users')
+      .update({ name, phone, address, updated_at: new Date() })
+      .eq('id', req.user.id)
+      .select()
+      .single();
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: 'Profile update failed' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// RECAPTCHA VERIFICATION
+// ═══════════════════════════════════════════════════════════════
+
+// POST /api/verify-captcha
+// Body: { token }
+app.post('/api/verify-captcha', async (req, res) => {
+  try {
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ success: false });
+
+    const r = await fetch(
+      `https://www.google.com/recaptcha/api/siteverify?secret=${process.env.RECAPTCHA_SECRET}&response=${token}`,
+      { method: 'POST' }
+    );
+    const data = await r.json();
+    // score >= 0.5 = human, < 0.5 = likely bot
+    res.json({ success: data.success, score: data.score, action: data.action });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// PRODUCTS
+// ═══════════════════════════════════════════════════════════════
+
+app.get('/api/products', async (req, res) => {
+  const { data, error } = await supabase
+    .from('products')
+    .select('*')
+    .eq('active', true)
+    .order('sort_order', { ascending: true });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.post('/api/products', authMiddleware, async (req, res) => {
+  const { data, error } = await supabase.from('products').insert([req.body]).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.put('/api/products/:id', authMiddleware, async (req, res) => {
+  const { data, error } = await supabase.from('products').update(req.body).eq('id', req.params.id).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.delete('/api/products/:id', authMiddleware, async (req, res) => {
+  await supabase.from('products').update({ active: false }).eq('id', req.params.id);
+  res.json({ success: true });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// COUPONS
+// ═══════════════════════════════════════════════════════════════
+
+app.get('/api/admin/coupons', authMiddleware, async (req, res) => {
+  const { data, error } = await supabase.from('coupons').select('*').order('created_at', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// POST /api/coupons/validate
+// Body: { code, subtotal }
+app.post('/api/coupons/validate', async (req, res) => {
+  try {
+    const { code, subtotal = 0 } = req.body;
+    if (!code) return res.status(400).json({ valid: false, message: 'No code provided' });
+
+    const { data: coupon } = await supabase
+      .from('coupons')
+      .select('*')
+      .ilike('code', code)
+      .single();
+
+    if (!coupon) return res.json({ valid: false, message: 'Invalid coupon code' });
+    if (!coupon.active) return res.json({ valid: false, message: 'This coupon is no longer active' });
+    if (coupon.min_order && subtotal < coupon.min_order) {
+      return res.json({ valid: false, message: `Minimum order ₹${coupon.min_order} required` });
+    }
+    if (coupon.expires_at && new Date(coupon.expires_at) < new Date()) {
+      return res.json({ valid: false, message: 'This coupon has expired' });
+    }
+    if (coupon.max_uses && coupon.used_count >= coupon.max_uses) {
+      return res.json({ valid: false, message: 'Coupon usage limit reached' });
+    }
+
+    const discount = coupon.type === 'percent'
+      ? Math.round(subtotal * coupon.value / 100)
+      : Math.min(coupon.value, subtotal);
+
+    res.json({
+      valid: true,
+      code: coupon.code,
+      type: coupon.type,
+      value: coupon.value,
+      discount,
+      label: coupon.label || (coupon.type === 'percent' ? `${coupon.value}% OFF` : `₹${coupon.value} OFF`),
+    });
+  } catch (err) {
+    res.status(500).json({ valid: false, message: 'Server error' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ORDERS
+// ═══════════════════════════════════════════════════════════════
+
+app.get('/api/admin/orders', authMiddleware, async (req, res) => {
+  const { data, error } = await supabase
+    .from('orders')
+    .select('*')
+    .order('created_at', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// GET /api/orders/my — orders for logged-in user
+app.get('/api/orders/my', authMiddleware, async (req, res) => {
+  const { data, error } = await supabase
+    .from('orders')
+    .select('*')
+    .eq('user_id', req.user.id)
+    .order('created_at', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// POST /api/orders — save new order (called after payment success)
+app.post('/api/orders', async (req, res) => {
+  try {
+    const order = {
+      ...req.body,
+      created_at: new Date(),
+      // Attach user_id if JWT provided
+      user_id: req.headers.authorization
+        ? (verifyToken(req.headers.authorization.replace('Bearer ', ''))?.id || null)
+        : null,
+    };
+    const { data, error } = await supabase.from('orders').insert([order]).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /api/admin/orders/:id — update order status
+app.put('/api/admin/orders/:id', authMiddleware, async (req, res) => {
+  const { data, error } = await supabase.from('orders').update(req.body).eq('id', req.params.id).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// ═══════════════════════════════════════════════════════════════
+// CASHFREE PAYMENTS
+// ═══════════════════════════════════════════════════════════════
+
+const CF_BASE = process.env.CASHFREE_ENV === 'PRODUCTION'
   ? 'https://api.cashfree.com/pg'
   : 'https://sandbox.cashfree.com/pg';
-const CF_VER   = '2023-08-01';
 
-// Supabase REST helper
-function sbHeaders(useService) {
-  var key = useService ? SB_SERVICE : SB_ANON;
-  return {
-    'apikey': key,
-    'Authorization': 'Bearer ' + key,
-    'Content-Type': 'application/json',
-    'Prefer': 'return=representation'
-  };
+// POST /api/create-cashfree-order
+app.post('/api/create-cashfree-order', async (req, res) => {
+  try {
+    const { amount, customer_name, customer_email, customer_phone, order_id } = req.body;
+
+    const payload = {
+      order_id:          order_id || ('ASC-' + Date.now()),
+      order_amount:      amount,
+      order_currency:    'INR',
+      customer_details:  { customer_id: customer_email, customer_name, customer_email, customer_phone },
+      order_meta:        { return_url: `${process.env.FRONTEND_URL}?order_id={order_id}` },
+    };
+
+    const r = await fetch(`${CF_BASE}/orders`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-version': '2023-08-01',
+        'x-client-id':     process.env.CASHFREE_APP_ID,
+        'x-client-secret': process.env.CASHFREE_SECRET_KEY,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.message || 'Cashfree order creation failed');
+    res.json(data);
+  } catch (err) {
+    console.error('Cashfree error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/verify-order/:orderId
+app.get('/api/verify-order/:orderId', async (req, res) => {
+  try {
+    const r = await fetch(`${CF_BASE}/orders/${req.params.orderId}`, {
+      headers: {
+        'x-api-version': '2023-08-01',
+        'x-client-id':     process.env.CASHFREE_APP_ID,
+        'x-client-secret': process.env.CASHFREE_SECRET_KEY,
+      },
+    });
+    const data = await r.json();
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// SHIPROCKET
+// ═══════════════════════════════════════════════════════════════
+
+let shiprocketToken = null;
+let shiprocketTokenExpiry = 0;
+
+async function getShiprocketToken() {
+  if (shiprocketToken && Date.now() < shiprocketTokenExpiry) return shiprocketToken;
+  const r = await fetch('https://apiv2.shiprocket.in/v1/external/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: process.env.SHIPROCKET_EMAIL, password: process.env.SHIPROCKET_PASSWORD }),
+  });
+  const data = await r.json();
+  shiprocketToken = data.token;
+  shiprocketTokenExpiry = Date.now() + (9 * 60 * 60 * 1000); // 9 hours
+  return shiprocketToken;
 }
 
-async function sbGet(table, query) {
-  var url = SB_URL + '/rest/v1/' + table + (query ? '?' + query : '');
-  var r = await axios.get(url, { headers: sbHeaders(true), timeout: 10000 });
-  return r.data;
-}
+// POST /api/create-shiprocket-order
+app.post('/api/create-shiprocket-order', async (req, res) => {
+  try {
+    const srToken = await getShiprocketToken();
+    const r = await fetch('https://apiv2.shiprocket.in/v1/external/orders/create/adhoc', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${srToken}` },
+      body: JSON.stringify(req.body),
+    });
+    const data = await r.json();
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
-async function sbInsert(table, data) {
-  var url = SB_URL + '/rest/v1/' + table;
-  var r = await axios.post(url, data, { headers: sbHeaders(true), timeout: 10000 });
-  return r.data;
-}
+// GET /api/track/:awb
+app.get('/api/track/:awb', async (req, res) => {
+  try {
+    const srToken = await getShiprocketToken();
+    const r = await fetch(`https://apiv2.shiprocket.in/v1/external/courier/track/awb/${req.params.awb}`, {
+      headers: { Authorization: `Bearer ${srToken}` },
+    });
+    res.json(await r.json());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
-async function sbUpdate(table, data, query) {
-  var url = SB_URL + '/rest/v1/' + table + '?' + query;
-  var r = await axios.patch(url, data, { headers: sbHeaders(true), timeout: 10000 });
-  return r.data;
-}
+// ═══════════════════════════════════════════════════════════════
+// INSTAGRAM
+// ═══════════════════════════════════════════════════════════════
 
-async function sbRpc(fn, params) {
-  var url = SB_URL + '/rest/v1/rpc/' + fn;
-  var r = await axios.post(url, params, { headers: sbHeaders(true), timeout: 10000 });
-  return r.data;
-}
+// GET /api/instagram — latest 5 posts
+app.get('/api/instagram', async (req, res) => {
+  try {
+    const token = process.env.INSTAGRAM_TOKEN;
+    if (!token) return res.status(500).json({ error: 'INSTAGRAM_TOKEN not set in env vars' });
 
-console.log('=== Ascovita Backend v4.1 (Supabase) ===');
-console.log('Cashfree mode :', CF_ENV);
-console.log('Supabase URL  :', SB_URL);
-console.log('Supabase Key  :', SB_ANON ? SB_ANON.slice(0,20)+'...' : 'NOT SET');
-console.log('Service Key   :', SB_SERVICE && SB_SERVICE !== SB_ANON ? 'SET (service_role)' : 'Using anon key');
-console.log('CF App ID     :', CF_APP_ID ? CF_APP_ID.slice(0,10)+'...' : 'NOT SET');
+    const r = await fetch(
+      `https://graph.instagram.com/me/media?fields=id,caption,media_url,thumbnail_url,permalink,media_type,like_count,comments_count&limit=5&access_token=${token}`
+    );
+    const data = await r.json();
+    if (data.error) throw new Error(data.error.message);
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
-// ─── MIDDLEWARE ───────────────────────────────────────────
-app.use(cors({ origin: '*', methods: ['GET','POST','PUT','DELETE','OPTIONS'] }));
-app.options('*', cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// GET /api/instagram/refresh — refresh the 60-day token
+app.get('/api/instagram/refresh', async (req, res) => {
+  try {
+    const token = process.env.INSTAGRAM_TOKEN;
+    const r = await fetch(
+      `https://graph.instagram.com/refresh_access_token?grant_type=ig_refresh_token&access_token=${token}`
+    );
+    const data = await r.json();
+    // Update INSTAGRAM_TOKEN in Render env vars manually with data.access_token
+    res.json({ new_token: data.access_token, expires_in: data.expires_in });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
-// ─── HEALTH ───────────────────────────────────────────────
-app.get('/', function(req, res) {
+// ═══════════════════════════════════════════════════════════════
+// HEALTH CHECK
+// ═══════════════════════════════════════════════════════════════
+
+app.get('/', (req, res) => {
   res.json({
     status: 'ok',
-    service: 'Ascovita Backend v4.1',
-    cashfree: CF_ENV,
-    cashfreeConfigured: !!(CF_APP_ID && CF_SECRET),
-    supabase: SB_URL,
-    supabaseKey: SB_ANON ? 'configured' : 'MISSING',
-    serviceKey: (SB_SERVICE && SB_SERVICE !== SB_ANON) ? 'configured' : 'using_anon',
-    timestamp: new Date().toISOString()
+    service: 'Ascovita Backend',
+    version: '3.0.0',
+    timestamp: new Date().toISOString(),
+    routes: [
+      'POST /api/auth/google',
+      'POST /api/auth/email-login',
+      'POST /api/auth/register',
+      'GET  /api/auth/me',
+      'PUT  /api/auth/profile',
+      'POST /api/verify-captcha',
+      'GET  /api/products',
+      'POST /api/coupons/validate',
+      'POST /api/orders',
+      'GET  /api/orders/my',
+      'POST /api/create-cashfree-order',
+      'GET  /api/verify-order/:id',
+      'POST /api/create-shiprocket-order',
+      'GET  /api/track/:awb',
+      'GET  /api/instagram',
+    ]
   });
 });
 
-// ─── DEBUG ────────────────────────────────────────────────
-app.get('/api/debug', async function(req, res) {
-  var result = { supabaseUrl: SB_URL, keySet: !!SB_ANON, serviceKeySet: SB_SERVICE !== SB_ANON };
-  try {
-    var r = await axios.get(SB_URL + '/rest/v1/products?limit=1', { headers: sbHeaders(false), timeout: 8000 });
-    result.dbConnection = 'OK';
-    result.dbStatus = r.status;
-    result.productsFound = Array.isArray(r.data) ? r.data.length : 'unknown';
-  } catch(e) {
-    result.dbConnection = 'FAILED';
-    result.dbError = e.message;
-    result.dbStatus = e.response ? e.response.status : null;
-    result.dbBody = e.response ? e.response.data : null;
-  }
-  res.json(result);
-});
-
-
-// ════════════════════════════════════════════════════════
-
-// GET all products
-app.get('/api/products', async function(req, res) {
-  try {
-    var data = await sbGet('products', 'active=eq.true&order=id.asc');
-    res.json({ success: true, data: data });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// GET single product
-app.get('/api/products/:id', async function(req, res) {
-  try {
-    var data = await sbGet('products', 'id=eq.' + req.params.id);
-    res.json({ success: true, data: data[0] || null });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// POST create product (admin)
-app.post('/api/products', async function(req, res) {
-  try {
-    var data = await sbInsert('products', req.body);
-    res.json({ success: true, data: data[0] });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// PUT update product (admin)
-app.put('/api/products/:id', async function(req, res) {
-  try {
-    var body = Object.assign({}, req.body, { updated_at: new Date().toISOString() });
-    var data = await sbUpdate('products', body, 'id=eq.' + req.params.id);
-    res.json({ success: true, data: data[0] });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ════════════════════════════════════════════════════════
-// COUPONS
-// ════════════════════════════════════════════════════════
-
-// Validate coupon
-app.post('/api/coupons/validate', async function(req, res) {
-  var code    = (req.body.code || '').toUpperCase().trim();
-  var amount  = parseFloat(req.body.amount) || 0;
-
-  if (!code) return res.status(400).json({ error: 'Coupon code required' });
-
-  try {
-    var rows = await sbGet('coupons', 'code=eq.' + code + '&active=eq.true');
-    if (!rows || rows.length === 0) {
-      return res.status(404).json({ error: 'Invalid or expired coupon code' });
-    }
-
-    var c = rows[0];
-
-    if (c.expires_at && new Date(c.expires_at) < new Date()) {
-      return res.status(400).json({ error: 'This coupon has expired' });
-    }
-    if (c.max_uses && c.used_count >= c.max_uses) {
-      return res.status(400).json({ error: 'This coupon has reached its usage limit' });
-    }
-    if (amount < c.min_order) {
-      return res.status(400).json({
-        error: 'Minimum order of Rs.' + c.min_order + ' required for this coupon'
-      });
-    }
-
-    var discount = 0;
-    if (c.type === 'percent') discount = Math.round(amount * c.value / 100);
-    else if (c.type === 'flat') discount = c.value;
-    else if (c.type === 'freeship') discount = 49;
-
-    res.json({
-      success: true,
-      coupon: c,
-      discount: discount,
-      finalAmount: Math.max(0, amount - discount)
-    });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ════════════════════════════════════════════════════════
-// ORDERS — CREATE (with Cashfree payment)
-// ════════════════════════════════════════════════════════
-app.post('/api/orders/create', async function(req, res) {
-  console.log('[create-order] received:', JSON.stringify(req.body));
-
-  var orderId       = req.body.orderId || ('AVC-' + Date.now());
-  var amount        = parseFloat(req.body.amount);
-  var customerName  = (req.body.customerName  || 'Customer').trim();
-  var customerEmail = (req.body.customerEmail || 'customer@ascovita.com').trim();
-  var customerPhone = String(req.body.customerPhone || '9999999999');
-  var items         = req.body.items || [];
-  var address       = req.body.address || {};
-  var couponCode    = req.body.couponCode || null;
-  var discount      = parseFloat(req.body.discount) || 0;
-  var shipping      = parseFloat(req.body.shipping) || 0;
-
-  if (!amount || amount <= 0) {
-    return res.status(400).json({ error: 'Invalid amount' });
-  }
-
-  // Clean phone
-  var phone = customerPhone.replace(/\D/g,'');
-  if (phone.startsWith('91') && phone.length === 12) phone = phone.slice(2);
-  if (phone.length !== 10) phone = '9999999999';
-
-  // 1. Save order to Supabase as Pending
-  try {
-    await sbInsert('orders', {
-      id:             orderId,
-      customer_name:  customerName,
-      customer_email: customerEmail,
-      customer_phone: phone,
-      address_line1:  address.line1 || '',
-      address_line2:  address.line2 || '',
-      city:           address.city  || '',
-      state:          address.state || '',
-      pincode:        address.pincode || '',
-      items:          JSON.stringify(items),
-      subtotal:       amount + discount - shipping,
-      discount:       discount,
-      shipping:       shipping,
-      total:          amount,
-      coupon_code:    couponCode,
-      payment_status: 'Pending',
-      fulfillment:    'Unfulfilled'
-    });
-    console.log('[create-order] saved to Supabase:', orderId);
-  } catch(dbErr) {
-    console.error('[create-order] DB error:', dbErr.message);
-    // Continue anyway - payment can proceed even if DB save fails
-  }
-
-  // 2. Update/create customer
-  try {
-    var existCust = await sbGet('customers', 'email=eq.' + encodeURIComponent(customerEmail));
-    if (existCust && existCust.length > 0) {
-      await sbUpdate('customers',
-        {
-          total_orders: existCust[0].total_orders + 1,
-          total_spent: parseFloat(existCust[0].total_spent) + amount,
-          updated_at: new Date().toISOString()
-        },
-        'email=eq.' + encodeURIComponent(customerEmail)
-      );
-    } else {
-      await sbInsert('customers', {
-        name:         customerName,
-        email:        customerEmail,
-        phone:        phone,
-        city:         address.city || '',
-        state:        address.state || '',
-        total_orders: 1,
-        total_spent:  amount
-      });
-    }
-  } catch(custErr) {
-    console.warn('[create-order] customer update error:', custErr.message);
-  }
-
-  // 3. If no Cashfree credentials, return demo mode
-  if (!CF_APP_ID || !CF_SECRET) {
-    return res.json({
-      success: true,
-      demo: true,
-      orderId: orderId,
-      message: 'Order saved. Add Cashfree credentials to enable real payments.'
-    });
-  }
-
-  // 4. Create Cashfree payment session
-  try {
-    var cfPayload = {
-      order_id: orderId,
-      order_amount: amount.toFixed(2),
-      order_currency: 'INR',
-      order_note: 'Ascovita Healthcare',
-      customer_details: {
-        customer_id: 'cust_' + phone,
-        customer_name: customerName.slice(0,50),
-        customer_email: customerEmail,
-        customer_phone: phone
-      },
-      order_meta: {
-        return_url: SITE_URL + '/#order-success?orderId=' + orderId + '&status=SUCCESS',
-        notify_url: 'https://ascopayment-2-0.onrender.com/api/webhook'
-      }
-    };
-
-    var cfRes = await axios.post(CF_BASE + '/orders', cfPayload, {
-      headers: {
-        'x-client-id': CF_APP_ID,
-        'x-client-secret': CF_SECRET,
-        'x-api-version': CF_VER,
-        'Content-Type': 'application/json'
-      },
-      timeout: 15000
-    });
-
-    var sessionId = cfRes.data.payment_session_id;
-    if (!sessionId) throw new Error('No payment_session_id from Cashfree');
-
-    // Save CF order ID to Supabase
-    await sbUpdate('orders',
-      { cf_order_id: cfRes.data.order_id, updated_at: new Date().toISOString() },
-      'id=eq.' + orderId
-    ).catch(function(){});
-
-    res.json({
-      success: true,
-      orderId: orderId,
-      paymentSessionId: sessionId,
-      orderStatus: cfRes.data.order_status
-    });
-
-  } catch(cfErr) {
-    var status  = cfErr.response ? cfErr.response.status : 500;
-    var cfError = cfErr.response ? cfErr.response.data : null;
-    console.error('[create-order] Cashfree error:', status, cfError || cfErr.message);
-
-    res.status(status).json({
-      error: cfError ? cfError.message : cfErr.message,
-      code:  cfError ? cfError.code   : 'CF_ERROR',
-      orderId: orderId
-    });
-  }
-});
-
-// ════════════════════════════════════════════════════════
-// PAYMENT VERIFY
-// ════════════════════════════════════════════════════════
-app.post('/api/payment/verify', async function(req, res) {
-  var orderId = req.body.orderId;
-  if (!orderId) return res.status(400).json({ error: 'orderId required' });
-
-  try {
-    var cfRes = await axios.get(CF_BASE + '/orders/' + orderId, {
-      headers: {
-        'x-client-id': CF_APP_ID,
-        'x-client-secret': CF_SECRET,
-        'x-api-version': CF_VER
-      },
-      timeout: 10000
-    });
-
-    var paid = cfRes.data.order_status === 'PAID';
-
-    if (paid) {
-      // Update order in Supabase
-      await sbUpdate('orders',
-        {
-          payment_status: 'Paid',
-          updated_at: new Date().toISOString()
-        },
-        'id=eq.' + orderId
-      ).catch(function(){});
-
-      // Update coupon usage if any
-      try {
-        var orderData = await sbGet('orders', 'id=eq.' + orderId);
-        if (orderData && orderData[0] && orderData[0].coupon_code) {
-          await sbRpc('increment_coupon_usage', { coupon_code: orderData[0].coupon_code }).catch(function(){});
-        }
-        // Deduct stock
-        if (orderData && orderData[0] && orderData[0].items) {
-          var items = typeof orderData[0].items === 'string'
-            ? JSON.parse(orderData[0].items)
-            : orderData[0].items;
-          for (var i = 0; i < items.length; i++) {
-            var item = items[i];
-            if (item.id) {
-              var prod = await sbGet('products', 'id=eq.' + item.id).catch(function(){ return []; });
-              if (prod && prod[0]) {
-                var newStock = Math.max(0, prod[0].stock - (item.qty || item.quantity || 1));
-                await sbUpdate('products', { stock: newStock }, 'id=eq.' + item.id).catch(function(){});
-              }
-            }
-          }
-        }
-      } catch(stockErr) {
-        console.warn('[verify] stock update error:', stockErr.message);
-      }
-    }
-
-    res.json({
-      success: true,
-      paid:        paid,
-      orderId:     cfRes.data.order_id,
-      orderStatus: cfRes.data.order_status,
-      amount:      cfRes.data.order_amount
-    });
-
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ════════════════════════════════════════════════════════
-// WEBHOOK (Cashfree calls this on payment events)
-// ════════════════════════════════════════════════════════
-app.post('/api/webhook', express.raw({ type: 'application/json' }), async function(req, res) {
-  try {
-    var body  = req.body.toString();
-    var data  = JSON.parse(body);
-    var event = data.type;
-    var order = (data.data && data.data.order) ? data.data.order : {};
-    var pay   = (data.data && data.data.payment) ? data.data.payment : {};
-
-    console.log('[webhook]', event, order.order_id, pay.payment_status);
-
-    if (event === 'PAYMENT_SUCCESS_WEBHOOK') {
-      await sbUpdate('orders',
-        {
-          payment_status: 'Paid',
-          cf_payment_id:  pay.cf_payment_id || '',
-          updated_at: new Date().toISOString()
-        },
-        'id=eq.' + order.order_id
-      ).catch(function(){});
-    } else if (event === 'PAYMENT_FAILED_WEBHOOK') {
-      await sbUpdate('orders',
-        { payment_status: 'Failed', updated_at: new Date().toISOString() },
-        'id=eq.' + order.order_id
-      ).catch(function(){});
-    }
-
-    res.json({ status: 'received' });
-  } catch(e) {
-    console.error('[webhook] error:', e.message);
-    res.status(400).json({ error: 'invalid payload' });
-  }
-});
-
-// ════════════════════════════════════════════════════════
-// ADMIN API — ORDERS
-// ════════════════════════════════════════════════════════
-app.get('/api/admin/orders', async function(req, res) {
-  try {
-    var query = 'order=created_at.desc&limit=100';
-    if (req.query.status)      query += '&payment_status=eq.' + req.query.status;
-    if (req.query.fulfillment) query += '&fulfillment=eq.' + req.query.fulfillment;
-    var data = await sbGet('orders', query);
-    res.json({ success: true, data: data, total: data.length });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.get('/api/admin/orders/:id', async function(req, res) {
-  try {
-    var data = await sbGet('orders', 'id=eq.' + req.params.id);
-    res.json({ success: true, data: data[0] || null });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.put('/api/admin/orders/:id', async function(req, res) {
-  try {
-    var body = Object.assign({}, req.body, { updated_at: new Date().toISOString() });
-    var data = await sbUpdate('orders', body, 'id=eq.' + req.params.id);
-    res.json({ success: true, data: data[0] });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ════════════════════════════════════════════════════════
-// ADMIN API — CUSTOMERS
-// ════════════════════════════════════════════════════════
-app.get('/api/admin/customers', async function(req, res) {
-  try {
-    var data = await sbGet('customers', 'order=created_at.desc&limit=200');
-    res.json({ success: true, data: data, total: data.length });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ════════════════════════════════════════════════════════
-// ADMIN API — DASHBOARD STATS
-// ════════════════════════════════════════════════════════
-app.get('/api/admin/stats', async function(req, res) {
-  try {
-    var orders    = await sbGet('orders',    'order=created_at.desc&limit=1000');
-    var customers = await sbGet('customers', 'select=id');
-    var products  = await sbGet('products',  'active=eq.true&select=id,stock');
-
-    var paidOrders  = orders.filter(function(o){ return o.payment_status === 'Paid'; });
-    var revenue     = paidOrders.reduce(function(s,o){ return s + parseFloat(o.total||0); }, 0);
-    var lowStock    = products.filter(function(p){ return p.stock < 20; }).length;
-
-    // Today's orders
-    var today = new Date().toISOString().split('T')[0];
-    var todayOrders = orders.filter(function(o){
-      return o.created_at && o.created_at.startsWith(today);
-    });
-
-    res.json({
-      success: true,
-      stats: {
-        totalOrders:    orders.length,
-        totalRevenue:   Math.round(revenue),
-        totalCustomers: customers.length,
-        totalProducts:  products.length,
-        lowStockCount:  lowStock,
-        todayOrders:    todayOrders.length,
-        todayRevenue:   Math.round(todayOrders.filter(function(o){ return o.payment_status==='Paid'; }).reduce(function(s,o){ return s+parseFloat(o.total||0); },0)),
-        pendingOrders:  orders.filter(function(o){ return o.fulfillment==='Unfulfilled' && o.payment_status==='Paid'; }).length
-      }
-    });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ════════════════════════════════════════════════════════
-// ADMIN API — COUPONS
-// ════════════════════════════════════════════════════════
-app.get('/api/admin/coupons', async function(req, res) {
-  try {
-    var data = await sbGet('coupons', 'order=created_at.desc');
-    res.json({ success: true, data: data });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.post('/api/admin/coupons', async function(req, res) {
-  try {
-    var data = await sbInsert('coupons', req.body);
-    res.json({ success: true, data: data[0] });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.put('/api/admin/coupons/:id', async function(req, res) {
-  try {
-    var data = await sbUpdate('coupons', req.body, 'id=eq.' + req.params.id);
-    res.json({ success: true, data: data[0] });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ════════════════════════════════════════════════════════
-// ADMIN API — BLOG
-// ════════════════════════════════════════════════════════
-app.get('/api/admin/blog', async function(req, res) {
-  try {
-    var data = await sbGet('blog_posts', 'order=created_at.desc');
-    res.json({ success: true, data: data });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.post('/api/admin/blog', async function(req, res) {
-  try {
-    var post = Object.assign({}, req.body);
-    if (!post.slug && post.title) {
-      post.slug = post.title.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');
-    }
-    var data = await sbInsert('blog_posts', post);
-    res.json({ success: true, data: data[0] });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.put('/api/admin/blog/:id', async function(req, res) {
-  try {
-    var body = Object.assign({}, req.body, { updated_at: new Date().toISOString() });
-    var data = await sbUpdate('blog_posts', body, 'id=eq.' + req.params.id);
-    res.json({ success: true, data: data[0] });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ─── START ────────────────────────────────────────────────
-app.listen(PORT, function() {
-  console.log('Ascovita Backend running on port', PORT);
-});
+app.listen(PORT, () => console.log(`✅ Ascovita backend running on port ${PORT}`));
