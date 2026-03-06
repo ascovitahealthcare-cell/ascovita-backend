@@ -10,10 +10,12 @@ const PORT = process.env.PORT || 3000;
 const CF_APP_ID   = process.env.CASHFREE_APP_ID   || '';
 const CF_SECRET   = process.env.CASHFREE_SECRET   || process.env.CASHFREE_SECRET_KEY || '';
 const CF_ENV      = (process.env.CASHFREE_ENV     || 'PROD').replace(/"/g,'').toUpperCase();
-const SB_URL      = process.env.SUPABASE_URL      || 'https://frwsjgrrtzhjfflcdjjs.supabase.co';
-const SB_KEY      = process.env.SUPABASE_KEY      || '';
-const SB_SERVICE  = process.env.SUPABASE_SERVICE  || ''; // service_role key - set in Render
 const SITE_URL    = process.env.SITE_URL          || 'https://darkblue-chimpanzee-556703.hostingersite.com';
+
+// Supabase — URL hardcoded, keys from env (with fallback to publishable key)
+const SB_URL      = 'https://frwsjgrrtzhjfflcdjjs.supabase.co';
+const SB_ANON     = process.env.SUPABASE_KEY     || 'sb_publishable_hcaCblRtB3GzYihyF23W7w_X4kRAiIU';
+const SB_SERVICE  = process.env.SUPABASE_SERVICE || process.env.SUPABASE_SERVICE_KEY || SB_ANON;
 
 const CF_BASE  = CF_ENV === 'PROD'
   ? 'https://api.cashfree.com/pg'
@@ -22,7 +24,7 @@ const CF_VER   = '2023-08-01';
 
 // Supabase REST helper
 function sbHeaders(useService) {
-  const key = useService && SB_SERVICE ? SB_SERVICE : SB_KEY;
+  var key = useService ? SB_SERVICE : SB_ANON;
   return {
     'apikey': key,
     'Authorization': 'Bearer ' + key,
@@ -55,9 +57,11 @@ async function sbRpc(fn, params) {
   return r.data;
 }
 
-console.log('=== Ascovita Backend v4.0 (Supabase) ===');
+console.log('=== Ascovita Backend v4.1 (Supabase) ===');
 console.log('Cashfree mode :', CF_ENV);
-console.log('Supabase URL  :', SB_URL ? 'SET' : 'NOT SET');
+console.log('Supabase URL  :', SB_URL);
+console.log('Supabase Key  :', SB_ANON ? SB_ANON.slice(0,20)+'...' : 'NOT SET');
+console.log('Service Key   :', SB_SERVICE && SB_SERVICE !== SB_ANON ? 'SET (service_role)' : 'Using anon key');
 console.log('CF App ID     :', CF_APP_ID ? CF_APP_ID.slice(0,10)+'...' : 'NOT SET');
 
 // ─── MIDDLEWARE ───────────────────────────────────────────
@@ -70,15 +74,34 @@ app.use(express.urlencoded({ extended: true }));
 app.get('/', function(req, res) {
   res.json({
     status: 'ok',
-    service: 'Ascovita Backend v4.0',
+    service: 'Ascovita Backend v4.1',
     cashfree: CF_ENV,
-    supabase: SB_URL ? 'configured' : 'not set',
+    cashfreeConfigured: !!(CF_APP_ID && CF_SECRET),
+    supabase: SB_URL,
+    supabaseKey: SB_ANON ? 'configured' : 'MISSING',
+    serviceKey: (SB_SERVICE && SB_SERVICE !== SB_ANON) ? 'configured' : 'using_anon',
     timestamp: new Date().toISOString()
   });
 });
 
-// ════════════════════════════════════════════════════════
-// PRODUCTS
+// ─── DEBUG ────────────────────────────────────────────────
+app.get('/api/debug', async function(req, res) {
+  var result = { supabaseUrl: SB_URL, keySet: !!SB_ANON, serviceKeySet: SB_SERVICE !== SB_ANON };
+  try {
+    var r = await axios.get(SB_URL + '/rest/v1/products?limit=1', { headers: sbHeaders(false), timeout: 8000 });
+    result.dbConnection = 'OK';
+    result.dbStatus = r.status;
+    result.productsFound = Array.isArray(r.data) ? r.data.length : 'unknown';
+  } catch(e) {
+    result.dbConnection = 'FAILED';
+    result.dbError = e.message;
+    result.dbStatus = e.response ? e.response.status : null;
+    result.dbBody = e.response ? e.response.data : null;
+  }
+  res.json(result);
+});
+
+
 // ════════════════════════════════════════════════════════
 
 // GET all products
