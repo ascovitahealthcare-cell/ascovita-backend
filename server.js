@@ -88,12 +88,15 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'ascovita2024';
 
 // POST /api/admin/login  — used by admin panel
 app.post('/api/admin/login', (req, res) => {
-  const { username, password } = req.body;
+  const { username, password } = req.body || {};
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password required' });
+  }
   if (username === 'admin' && password === ADMIN_PASSWORD) {
     const token = signToken({ role: 'admin', email: 'admin@ascovita.com' });
-    return res.json({ token, role: 'admin' });
+    return res.json({ token, role: 'admin', message: 'Login successful' });
   }
-  return res.status(401).json({ error: 'Invalid credentials' });
+  return res.status(401).json({ error: 'Invalid username or password' });
 });
 
 // ═══════════════════════════════════════════════════════════════
