@@ -571,25 +571,53 @@ const CF_BASE = process.env.CASHFREE_ENV === 'PRODUCTION'
 
 app.post('/api/create-cashfree-order', async (req, res) => {
   try {
-    const { amount, customer_name, customer_email, customer_phone, order_id } = req.body;
+    const body = req.body || {};
 
-    if (!amount || !customer_email) {
-      return res.status(400).json({ error: 'amount and customer_email are required' });
+    // Support ALL field name formats the frontend might send
+    const amount         = body.amount
+                        || body.order_amount
+                        || body.order_amount_value
+                        || (body.customer_details && body.total)
+                        || null;
+
+    const customer_email = body.customer_email
+                        || (body.customer_details && body.customer_details.customer_email)
+                        || body.email
+                        || null;
+
+    const customer_name  = body.customer_name
+                        || (body.customer_details && body.customer_details.customer_name)
+                        || body.name
+                        || 'Customer';
+
+    const customer_phone = body.customer_phone
+                        || (body.customer_details && body.customer_details.customer_phone)
+                        || body.phone
+                        || '9999999999';
+
+    const order_id = body.order_id || ('ASC-' + Date.now());
+
+    // Log for debugging
+    console.log('Cashfree order request:', { amount, customer_email, customer_name, order_id, raw_keys: Object.keys(body) });
+
+    if (!amount) {
+      return res.status(400).json({ error: 'Missing amount. Received fields: ' + Object.keys(body).join(', ') });
     }
-
-    const orderId = order_id || ('ASC-' + Date.now());
+    if (!customer_email) {
+      return res.status(400).json({ error: 'Missing customer_email. Received fields: ' + Object.keys(body).join(', ') });
+    }
     const payload = {
-      order_id:         orderId,
+      order_id:         order_id,
       order_amount:     parseFloat(amount),
       order_currency:   'INR',
       customer_details: {
         customer_id:    customer_email.replace(/[^a-zA-Z0-9_-]/g, '_'),
         customer_name:  customer_name || 'Customer',
         customer_email: customer_email,
-        customer_phone: customer_phone || '9999999999',
+        customer_phone: String(customer_phone).replace(/^\+/, ''),
       },
       order_meta: {
-        return_url: `${process.env.FRONTEND_URL || ''}?order_id=${orderId}`,
+        return_url: `${process.env.FRONTEND_URL || ''}?order_id=${order_id}`,
         notify_url: `https://ascovita-backend.onrender.com/api/cashfree-webhook`,
       },
     };
@@ -867,6 +895,10 @@ app.get('/', (req, res) => {
       'POST /api/auth/email-login',
       'POST /api/auth/register',
     ]
+  });
+});
+
+app.listen(PORT, () => console.log(`✅ Ascovita backend v4.0 running on port ${PORT}`));
   });
 });
 
