@@ -899,7 +899,3 @@ app.get('/', (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`✅ Ascovita backend v4.0 running on port ${PORT}`));
-  });
-});
-
-app.listen(PORT, () => console.log(`✅ Ascovita backend v4.0 running on port ${PORT}`));
