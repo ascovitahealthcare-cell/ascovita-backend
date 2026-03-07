@@ -20,17 +20,3 @@
     "node": ">=18.0.0"
   }
 }
-```
-
----
-
-### Also delete these folders from GitHub (no longer needed):
-```
-middleware/   ← delete
-models/       ← delete
-migrations/   ← delete
-seeders/      ← delete
-routes/       ← delete
-utils/        ← delete
-config/       ← delete
-.sequelizerc  ← delete
