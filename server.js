@@ -28,10 +28,11 @@
 
 'use strict';
 
-const express = require('express');
-const cors    = require('cors');
-const fetch   = require('node-fetch');
-const jwt     = require('jsonwebtoken');
+const express    = require('express');
+const cors       = require('cors');
+const fetch      = require('node-fetch');
+const jwt        = require('jsonwebtoken');
+const nodemailer = require('nodemailer');
 const { createClient } = require('@supabase/supabase-js');
 
 const app  = express();
@@ -42,6 +43,121 @@ const supabase = createClient(
   process.env.SUPABASE_URL         || '',
   process.env.SUPABASE_SERVICE_KEY || ''
 );
+
+// ═══════════════════════════════════════════════════════════════
+// EMAIL SYSTEM (Nodemailer via Gmail)
+// ENV VARS: MAIL_USER, MAIL_PASSWORD, MAIL_FROM
+// ═══════════════════════════════════════════════════════════════
+const mailTransporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.MAIL_USER     || '',
+    pass: process.env.MAIL_PASSWORD || '',
+  },
+});
+
+async function sendOrderEmail(order) {
+  if (!process.env.MAIL_USER || !process.env.MAIL_PASSWORD) {
+    console.warn('[EMAIL] MAIL_USER or MAIL_PASSWORD not set — skipping');
+    return;
+  }
+  if (!order.customer_email) return;
+
+  let items = [];
+  try { items = typeof order.items === 'string' ? JSON.parse(order.items) : (order.items || []); } catch(e) {}
+
+  const itemRows = items.map(i => `
+    <tr>
+      <td style="padding:10px 12px;border-bottom:1px solid #f0f0f0;font-size:14px;color:#333">${i.name||'Product'}</td>
+      <td style="padding:10px 12px;border-bottom:1px solid #f0f0f0;font-size:14px;text-align:center">${i.qty||i.units||1}</td>
+      <td style="padding:10px 12px;border-bottom:1px solid #f0f0f0;font-size:14px;text-align:right">&#8377;${(i.price||i.selling_price||0).toLocaleString('en-IN')}</td>
+    </tr>`).join('');
+
+  const payBadge = order.payment_status === 'Paid'
+    ? '<span style="background:#dcfce7;color:#166534;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600">✅ PAID</span>'
+    : '<span style="background:#fef9c3;color:#854d0e;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600">💵 COD</span>';
+
+  const html = `<!DOCTYPE html><html><body style="margin:0;padding:0;background:#f5f5f5;font-family:Arial,sans-serif">
+  <div style="max-width:600px;margin:30px auto;background:white;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.08)">
+    <div style="background:linear-gradient(135deg,#2d5016,#4a7c2f);padding:32px 40px;text-align:center">
+      <div style="font-size:28px;font-weight:800;color:white">ASCOVITA</div>
+      <div style="font-size:13px;color:#a8d5a2;margin-top:4px">Healthcare &amp; Wellness</div>
+    </div>
+    <div style="padding:32px 40px 0;text-align:center">
+      <div style="font-size:40px">🎉</div>
+      <h1 style="font-size:22px;color:#1a1a1a;margin:12px 0 6px">Order Confirmed!</h1>
+      <p style="color:#666;font-size:14px;margin:0">Thank you ${order.customer_name||'valued customer'}! Your order has been placed successfully.</p>
+    </div>
+    <div style="margin:24px 40px;background:#f8fdf4;border:2px solid #4a7c2f;border-radius:12px;padding:16px;text-align:center">
+      <div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">Order ID</div>
+      <div style="font-size:18px;font-weight:700;color:#2d5016">${order.id||order.order_id||''}</div>
+      <div style="margin-top:8px">${payBadge}</div>
+    </div>
+    <div style="padding:0 40px">
+      <h3 style="font-size:15px;color:#333;margin-bottom:12px">📦 Items Ordered</h3>
+      <table style="width:100%;border-collapse:collapse;background:#fafafa;border-radius:10px;overflow:hidden">
+        <thead><tr style="background:#f0f0f0">
+          <th style="padding:10px 12px;text-align:left;font-size:12px;color:#666">Product</th>
+          <th style="padding:10px 12px;text-align:center;font-size:12px;color:#666">Qty</th>
+          <th style="padding:10px 12px;text-align:right;font-size:12px;color:#666">Price</th>
+        </tr></thead>
+        <tbody>${itemRows}</tbody>
+        <tfoot><tr style="background:#f8fdf4">
+          <td colspan="2" style="padding:12px;font-weight:700;font-size:15px;color:#2d5016">Total</td>
+          <td style="padding:12px;font-weight:700;font-size:15px;color:#2d5016;text-align:right">&#8377;${parseFloat(order.total||0).toLocaleString('en-IN')}</td>
+        </tr></tfoot>
+      </table>
+    </div>
+    <div style="margin:24px 40px;background:#f9f9f9;border-radius:12px;padding:20px">
+      <h3 style="font-size:15px;color:#333;margin:0 0 14px">🏠 Delivery Address</h3>
+      <p style="margin:0;font-size:14px;color:#555;line-height:1.7">
+        <strong>${order.customer_name||''}</strong><br>
+        ${order.address_line1||''} ${order.address_line2||''}<br>
+        ${order.city||''}, ${order.state||''} - ${order.pincode||''}<br>
+        📞 ${order.customer_phone||''}
+      </p>
+    </div>
+    <div style="margin:0 40px 24px;background:#fffbeb;border:1px solid #fcd34d;border-radius:12px;padding:20px">
+      <h3 style="font-size:15px;color:#92400e;margin:0 0 10px">⏱️ What happens next?</h3>
+      <p style="margin:0;font-size:13px;color:#78350f;line-height:1.8">
+        1. We will process and pack your order within <strong>24-48 hours</strong><br>
+        2. You will receive a tracking link once shipped<br>
+        3. Estimated delivery: <strong>4-7 working days</strong>
+      </p>
+    </div>
+    <div style="padding:0 40px 32px;text-align:center">
+      <p style="font-size:13px;color:#888;margin-bottom:16px">Need help? We are here for you!</p>
+      <a href="https://wa.me/919898582650" style="display:inline-block;background:#25d366;color:white;padding:10px 24px;border-radius:8px;font-weight:600;font-size:13px;text-decoration:none;margin-right:8px">💬 WhatsApp</a>
+      <a href="mailto:ascovitahealthcare@gmail.com" style="display:inline-block;background:#f0f0f0;color:#333;padding:10px 24px;border-radius:8px;font-weight:600;font-size:13px;text-decoration:none">✉️ Email</a>
+    </div>
+    <div style="background:#f5f5f5;padding:20px 40px;text-align:center">
+      <p style="margin:0;font-size:12px;color:#999">© 2025 Ascovita Healthcare. All rights reserved.</p>
+    </div>
+  </div>
+</body></html>`;
+
+  try {
+    await mailTransporter.sendMail({
+      from:    process.env.MAIL_FROM || `Ascovita Healthcare <${process.env.MAIL_USER}>`,
+      to:      order.customer_email,
+      subject: `✅ Order Confirmed — ${order.id||order.order_id} | Ascovita Healthcare`,
+      html,
+    });
+    console.log(`✅ [EMAIL] Confirmation sent to ${order.customer_email}`);
+
+    // Admin copy
+    await mailTransporter.sendMail({
+      from:    process.env.MAIL_FROM || `Ascovita Healthcare <${process.env.MAIL_USER}>`,
+      to:      process.env.MAIL_USER,
+      subject: `🛒 New Order: ${order.id||order.order_id} — ₹${order.total} — ${order.customer_name}`,
+      html:    `<p><b>Order:</b> ${order.id||order.order_id}</p><p><b>Customer:</b> ${order.customer_name} (${order.customer_email})</p><p><b>Phone:</b> ${order.customer_phone}</p><p><b>Total:</b> ₹${order.total}</p><p><b>Payment:</b> ${order.payment_status}</p><p><b>Address:</b> ${order.address_line1}, ${order.city}, ${order.state} - ${order.pincode}</p>`,
+    });
+    console.log(`✅ [EMAIL] Admin notification sent`);
+  } catch(err) {
+    console.error('[EMAIL] Failed:', err.message);
+  }
+}
+
 
 // ── CORS ──────────────────────────────────────────────────────────
 const ALLOWED_ORIGINS = [
@@ -563,6 +679,7 @@ app.post('/api/orders', async (req, res) => {
     }
 
     await writeAudit({ tableName: 'orders', recordId: data.id, action: 'INSERT', newValues: { total: order.total, customer_email: order.customer_email }, ipAddress: req.ip });
+    await sendOrderEmail(data);
     res.json(data);
   } catch (err) {
     console.error('Create order error:', err);
@@ -868,6 +985,7 @@ app.post('/api/confirm-order', async (req, res) => {
     }
 
     await writeAudit({ tableName: 'orders', recordId: data.id, action: 'INSERT', newValues: { total: order.total, payment_status: 'Paid' }, ipAddress: req.ip });
+    await sendOrderEmail(data);
     res.json({ success: true, order_id: cf_order_id, data });
   } catch (err) {
     res.status(500).json({ error: err.message });
