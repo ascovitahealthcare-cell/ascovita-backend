@@ -289,13 +289,29 @@ app.get('/api/admin/products', authMiddleware, async (req, res) => {
 // POST /api/products — add product (admin only)
 app.post('/api/products', authMiddleware, async (req, res) => {
   try {
-    const body = { ...req.body, created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
-    // Remove sort_order if passed (not in schema)
-    delete body.sort_order;
+    const b = req.body;
+    const body = {
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      active: b.active !== false,
+    };
+    const fields = [
+      'name','brand','category','badge','description','tags',
+      'price','sale_price','offer_text',
+      'stock','rating','reviews',
+      'image','image2','image3','image4','image5','images',
+      'key_ingredients','how_to_use','has_tiers','tiers',
+      'seo_keywords','meta_description','hsn',
+    ];
+    fields.forEach(f => { if (b[f] !== undefined) body[f] = b[f]; });
+    if ('sale_price' in b) body.sale_price = b.sale_price || null;
+
     const { data, error } = await supabase.from('products').insert([body]).select().single();
     if (error) throw error;
+    console.log('✅ Product created:', data.id, data.name);
     res.json(data);
   } catch (err) {
+    console.error('Create product error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -303,8 +319,23 @@ app.post('/api/products', authMiddleware, async (req, res) => {
 // PUT /api/products/:id — update product
 app.put('/api/products/:id', authMiddleware, async (req, res) => {
   try {
-    const body = { ...req.body, updated_at: new Date().toISOString() };
-    delete body.sort_order;
+    const b = req.body;
+    const body = {
+      updated_at: new Date().toISOString(),
+    };
+    // Only update fields that are present in the request
+    const fields = [
+      'name','brand','category','badge','description','tags',
+      'price','sale_price','offer_text',
+      'stock','active','rating','reviews',
+      'image','image2','image3','image4','image5','images',
+      'key_ingredients','how_to_use','has_tiers','tiers',
+      'seo_keywords','meta_description','hsn',
+    ];
+    fields.forEach(f => { if (b[f] !== undefined) body[f] = b[f]; });
+    // Null handling for sale_price
+    if ('sale_price' in b) body.sale_price = b.sale_price || null;
+
     const { data, error } = await supabase
       .from('products')
       .update(body)
@@ -314,6 +345,7 @@ app.put('/api/products/:id', authMiddleware, async (req, res) => {
     if (error) throw error;
     res.json(data);
   } catch (err) {
+    console.error('Update product error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -968,7 +1000,5 @@ app.get('/', (req, res) => {
     ]
   });
 });
-
-app.listen(PORT, () => console.log(`✅ Ascovita backend v4.0 running on port ${PORT}`));
 
 app.listen(PORT, () => console.log(`✅ Ascovita backend v4.0 running on port ${PORT}`));
