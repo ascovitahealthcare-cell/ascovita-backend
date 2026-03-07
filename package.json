@@ -1,29 +1,36 @@
 {
   "name": "ascovita-backend",
-  "version": "2.0.0",
+  "version": "4.0.0",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js",
-    "db:migrate": "npx sequelize-cli db:migrate",
-    "db:seed": "npx sequelize-cli db:seed:all"
+    "dev": "nodemon server.js"
   },
   "dependencies": {
-    "bcryptjs": "^2.4.3",
+    "@supabase/supabase-js": "^2.39.0",
     "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "express": "^4.18.3",
-    "express-rate-limit": "^7.2.0",
-    "google-auth-library": "^9.9.0",
-    "helmet": "^7.1.0",
+    "express": "^4.18.2",
     "jsonwebtoken": "^9.0.2",
-    "pg": "^8.11.5",
-    "pg-hstore": "^2.3.4",
-    "sequelize": "^6.37.3",
-    "sequelize-cli": "^6.6.2",
-    "umzug": "^3.8.0"
+    "node-fetch": "^2.7.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.0"
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
+```
+→ **Commit**
+
+### Step 3 — Delete all the new folders we added
+Delete these folders from GitHub one by one:
+```
+middleware/    ← delete
+models/        ← delete
+migrations/    ← delete
+seeders/       ← delete
+routes/        ← delete
+utils/         ← delete
+config/        ← delete
+.sequelizerc   ← delete
