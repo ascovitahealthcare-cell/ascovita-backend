@@ -1,6 +1,6 @@
 {
   "name": "ascovita-backend",
-  "version": "5.0.0",
+  "version": "6.0.0",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -11,7 +11,8 @@
     "cors": "^2.8.5",
     "express": "^4.18.2",
     "jsonwebtoken": "^9.0.2",
-    "node-fetch": "^2.7.0"
+    "node-fetch": "^2.7.0",
+    "nodemailer": "^6.9.13"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
