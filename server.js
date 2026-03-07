@@ -15,7 +15,7 @@
 //   INSTAGRAM_TOKEN         instagram long-lived token
 //   RECAPTCHA_SECRET        recaptcha v3 secret
 //   FRONTEND_URL            https://yourusername.github.io
-//   ADMIN_PASSWORD          your admin panel password (default: ascovita2024)
+//   ADMIN_PASSWORD          your admin panel password
 // ═══════════════════════════════════════════════════════════════════
 
 'use strict';
@@ -50,9 +50,8 @@ app.use(cors({
   origin: (origin, cb) => {
     // Allow requests with no origin (mobile apps, Postman, curl)
     if (!origin) return cb(null, true);
-    // Allow if origin starts with any allowed origin
+    // Allow if origin is in list OR is ascovita.com OR github.io
     const allowed = ALLOWED_ORIGINS.some(o => o && origin.startsWith(o));
-    // Also allow github.io pages and ascovita.com
     if (allowed || origin.endsWith('.github.io') || origin.includes('github.io') || origin.includes('ascovita.com')) {
       return cb(null, true);
     }
@@ -66,7 +65,7 @@ app.options('*', cors());
 app.use(express.json({ limit: '5mb' }));
 
 // ── JWT helpers ───────────────────────────────────────────────────
-const JWT_SECRET = process.env.JWT_SECRET || 'ascovita-secret-change-me';
+const JWT_SECRET = process.env.JWT_SECRET;
 
 function signToken(payload) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: '30d' });
@@ -86,7 +85,7 @@ function authMiddleware(req, res, next) {
 }
 
 // ── Simple admin password check (for admin panel JWT) ─────────────
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'ascovita2024';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 
 // POST /api/admin/login  — used by admin panel
 app.post('/api/admin/login', (req, res) => {
@@ -630,7 +629,7 @@ app.post('/api/create-cashfree-order', async (req, res) => {
         'Content-Type':    'application/json',
         'x-api-version':   '2023-08-01',
         'x-client-id':     process.env.CASHFREE_APP_ID     || '',
-        'x-client-secret': process.env.CASHFREE_SECRET_KEY || '',
+        'x-client-secret': process.env.CASHFREE_SECRET_KEY || process.env.CASHFREE_SECRET || '',
       },
       body: JSON.stringify(payload),
     });
@@ -654,7 +653,7 @@ app.get('/api/verify-order/:orderId', async (req, res) => {
       headers: {
         'x-api-version':   '2023-08-01',
         'x-client-id':     process.env.CASHFREE_APP_ID     || '',
-        'x-client-secret': process.env.CASHFREE_SECRET_KEY || '',
+        'x-client-secret': process.env.CASHFREE_SECRET_KEY || process.env.CASHFREE_SECRET || '',
       },
     });
     const data = await r.json();
@@ -744,21 +743,91 @@ async function shiprocketRequest(url, options = {}) {
 // POST /api/create-shiprocket-order
 app.post('/api/create-shiprocket-order', async (req, res) => {
   try {
+    const b = req.body;
+
+    // ── Clean & validate all fields per Shiprocket API v2 spec ──
+    const phone    = String(b.billing_phone  || '').replace(/\D/g, '').slice(-10);
+    const pincode  = String(b.billing_pincode || '').replace(/\D/g, '').slice(0, 6);
+    const orderId  = String(b.order_id || '').slice(0, 50);
+    const lastName = (b.billing_last_name && b.billing_last_name.trim()) ? b.billing_last_name.trim() : '.';
+
+    const orderItems = Array.isArray(b.order_items) ? b.order_items.map(item => ({
+      name:          String(item.name || 'Product').slice(0, 100),
+      sku:           String(item.sku  || 'SKU-001').slice(0, 50),
+      units:         parseInt(item.units)          || 1,
+      selling_price: parseFloat(item.selling_price) || 0,
+      mrp:           parseFloat(item.mrp)           || parseFloat(item.selling_price) || 0,
+      discount:      parseFloat(item.discount)      || 0,
+      tax:           '',
+      hsn:           '30049099',
+    })) : [];
+
+    const subTotal = parseFloat(b.sub_total) || orderItems.reduce((s, i) => s + i.selling_price * i.units, 0);
+
+    const payload = {
+      order_id:               orderId,
+      order_date:             b.order_date || new Date().toISOString().slice(0,19).replace('T',' '),
+      pickup_location:        'Primary',
+
+      // Billing
+      billing_customer_name:  String(b.billing_customer_name || '').trim(),
+      billing_last_name:      lastName,
+      billing_address:        String(b.billing_address   || '').trim(),
+      billing_address_2:      String(b.billing_address_2 || '').trim(),
+      billing_city:           String(b.billing_city  || '').trim(),
+      billing_pincode:        pincode,
+      billing_state:          String(b.billing_state || '').trim(),
+      billing_country:        'India',
+      billing_email:          String(b.billing_email || '').trim().toLowerCase(),
+      billing_phone:          phone,
+
+      // Shipping = billing
+      shipping_is_billing:    true,
+
+      // Items
+      order_items:            orderItems,
+
+      // Payment
+      payment_method:         b.payment_method === 'COD' ? 'COD' : 'Prepaid',
+      sub_total:              subTotal,
+
+      // Dimensions (standard for tablet/supplement boxes)
+      length:                 parseFloat(b.length)  || 15,
+      breadth:                parseFloat(b.breadth) || 10,
+      height:                 parseFloat(b.height)  || 10,
+      weight:                 parseFloat(b.weight)  || 0.3,
+    };
+
+    console.log('📦 Shiprocket payload:', JSON.stringify(payload, null, 2));
+
     const data = await shiprocketRequest(
       'https://apiv2.shiprocket.in/v1/external/orders/create/adhoc',
-      { method: 'POST', body: JSON.stringify(req.body) }
+      { method: 'POST', body: JSON.stringify(payload) }
     );
-    // Save shiprocket order id back to our order
-    if (data.order_id && req.body.order_id) {
+
+    console.log('📦 Shiprocket response:', JSON.stringify(data));
+
+    // Shiprocket returns errors as 200 OK with { message, errors } — check for order_id
+    if (!data.order_id) {
+      console.error('❌ Shiprocket rejected order:', JSON.stringify(data));
+      return res.status(422).json({
+        error:   data.message || 'Shiprocket rejected the order',
+        details: data.errors  || data,
+      });
+    }
+
+    // ✅ Success — update Supabase with Shiprocket IDs
+    if (payload.order_id) {
       await supabase.from('orders').update({
         shiprocket_id: String(data.order_id),
         fulfillment:   'Processing',
         updated_at:    new Date().toISOString(),
-      }).eq('id', req.body.order_id);
+      }).eq('id', payload.order_id).catch(e => console.warn('Supabase update:', e.message));
     }
+
     res.json(data);
   } catch (err) {
-    console.error('Shiprocket error:', err);
+    console.error('❌ Shiprocket exception:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -899,5 +968,7 @@ app.get('/', (req, res) => {
     ]
   });
 });
+
+app.listen(PORT, () => console.log(`✅ Ascovita backend v4.0 running on port ${PORT}`));
 
 app.listen(PORT, () => console.log(`✅ Ascovita backend v4.0 running on port ${PORT}`));
