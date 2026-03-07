@@ -37,6 +37,8 @@ const supabase = createClient(
 
 // ── CORS ──────────────────────────────────────────────────────────
 const ALLOWED_ORIGINS = [
+  'https://ascovita.com',
+  'https://www.ascovita.com',
   process.env.FRONTEND_URL || '',
   'http://localhost:3000',
   'http://localhost:5500',
@@ -50,8 +52,8 @@ app.use(cors({
     if (!origin) return cb(null, true);
     // Allow if origin starts with any allowed origin
     const allowed = ALLOWED_ORIGINS.some(o => o && origin.startsWith(o));
-    // Also allow github.io pages
-    if (allowed || origin.endsWith('.github.io') || origin.includes('github.io')) {
+    // Also allow github.io pages and ascovita.com
+    if (allowed || origin.endsWith('.github.io') || origin.includes('github.io') || origin.includes('ascovita.com')) {
       return cb(null, true);
     }
     cb(new Error('CORS: origin not allowed → ' + origin));
