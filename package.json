@@ -1,6 +1,6 @@
 {
   "name": "ascovita-backend",
-  "version": "4.0.0",
+  "version": "5.0.0",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -21,16 +21,16 @@
   }
 }
 ```
-→ **Commit**
 
-### Step 3 — Delete all the new folders we added
-Delete these folders from GitHub one by one:
+---
+
+### Also delete these folders from GitHub (no longer needed):
 ```
-middleware/    ← delete
-models/        ← delete
-migrations/    ← delete
-seeders/       ← delete
-routes/        ← delete
-utils/         ← delete
-config/        ← delete
-.sequelizerc   ← delete
+middleware/   ← delete
+models/       ← delete
+migrations/   ← delete
+seeders/      ← delete
+routes/       ← delete
+utils/        ← delete
+config/       ← delete
+.sequelizerc  ← delete
