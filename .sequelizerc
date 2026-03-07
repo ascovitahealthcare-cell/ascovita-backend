@@ -1,0 +1,32 @@
+const path = require('path');
+module.exports = {
+  'config':          path.resolve('config', 'database.js'),
+  'models-path':     path.resolve('models'),
+  'seeders-path':    path.resolve('seeders'),
+  'migrations-path': path.resolve('migrations'),
+};
+```
+→ Click **Commit**
+
+---
+
+## After all this your repo should look like ✅:
+```
+config/
+  database.js
+middleware/
+  audit.js
+  auth.js
+migrations/
+  20240101000001-create-all-tables.js
+models/
+  index.js
+routes/
+  admin.js  auth.js  coupons.js  orders.js  products.js  reviews.js
+seeders/
+  20240101000001-admin-and-defaults.js
+utils/
+  jwt.js
+package.json
+server.js
+.sequelizerc
