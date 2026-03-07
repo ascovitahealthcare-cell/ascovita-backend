@@ -650,7 +650,7 @@ app.post('/api/create-cashfree-order', async (req, res) => {
         customer_phone: String(customer_phone).replace(/^\+/, ''),
       },
       order_meta: {
-        return_url: `${process.env.FRONTEND_URL || ''}?order_id=${order_id}`,
+        return_url: `${process.env.FRONTEND_URL || ''}?cf_order=${order_id}`,
         notify_url: `https://ascovita-backend.onrender.com/api/cashfree-webhook`,
       },
     };
@@ -701,21 +701,150 @@ app.get('/api/verify-order/:orderId', async (req, res) => {
   }
 });
 
-// POST /api/cashfree-webhook — Cashfree payment webhook
-app.post('/api/cashfree-webhook', async (req, res) => {
+// POST /api/cashfree-webhook — Cashfree payment webhook (with signature verification)
+app.post('/api/cashfree-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
-    const event = req.body;
-    console.log('Cashfree webhook:', JSON.stringify(event));
-    if (event?.data?.order?.order_status === 'PAID') {
+    // ── Verify Cashfree webhook signature ──
+    const crypto = require('crypto');
+    const rawBody = req.body;
+    const receivedSig = req.headers['x-webhook-signature'];
+    const timestamp = req.headers['x-webhook-timestamp'];
+    
+    if (receivedSig && timestamp && process.env.CASHFREE_SECRET_KEY) {
+      const signedPayload = timestamp + rawBody.toString();
+      const expectedSig = crypto
+        .createHmac('sha256', process.env.CASHFREE_SECRET_KEY)
+        .update(signedPayload)
+        .digest('base64');
+      if (receivedSig !== expectedSig) {
+        console.warn('⚠️ Webhook signature mismatch — ignoring');
+        return res.status(401).json({ error: 'Invalid signature' });
+      }
+    }
+
+    const event = typeof rawBody === 'string' ? JSON.parse(rawBody) : (Buffer.isBuffer(rawBody) ? JSON.parse(rawBody.toString()) : rawBody);
+    console.log('Cashfree webhook event type:', event?.type, 'order:', event?.data?.order?.order_id);
+
+    // Only process confirmed PAID events
+    if (event?.type === 'PAYMENT_SUCCESS_WEBHOOK' || event?.data?.order?.order_status === 'PAID') {
       const orderId = event.data.order.order_id;
-      await supabase.from('orders').update({
-        payment_status: 'Paid',
-        cf_payment_id:  event.data.payment?.cf_payment_id || '',
-        updated_at:     new Date().toISOString(),
-      }).eq('id', orderId);
+      const cfPaymentId = event.data.payment?.cf_payment_id || '';
+      
+      // Double-check with Cashfree API before marking as paid
+      const verifyR = await fetch(`${CF_BASE}/orders/${orderId}`, {
+        headers: {
+          'x-api-version': '2023-08-01',
+          'x-client-id': process.env.CASHFREE_APP_ID || '',
+          'x-client-secret': process.env.CASHFREE_SECRET_KEY || '',
+        },
+      });
+      const verifyData = await verifyR.json();
+      
+      if (verifyData.order_status === 'PAID') {
+        await supabase.from('orders').update({
+          payment_status: 'Paid',
+          cf_payment_id:  cfPaymentId,
+          updated_at:     new Date().toISOString(),
+        }).eq('id', orderId);
+        console.log('✅ Webhook: order', orderId, 'marked PAID');
+      } else {
+        console.warn('⚠️ Webhook claimed PAID but API says:', verifyData.order_status, 'for order:', orderId);
+      }
     }
     res.json({ status: 'ok' });
   } catch (err) {
+    console.error('Webhook error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ═══════════════════════════════════════════════════════════════
+// SAFE ORDER CONFIRMATION — verify payment THEN create order
+// Frontend should call this instead of /api/orders directly
+// ═══════════════════════════════════════════════════════════════
+app.post('/api/confirm-order', async (req, res) => {
+  try {
+    const { cf_order_id, order_data } = req.body;
+    
+    if (!cf_order_id) {
+      return res.status(400).json({ error: 'Missing cf_order_id' });
+    }
+
+    // Step 1: Verify payment with Cashfree API
+    const verifyR = await fetch(`${CF_BASE}/orders/${cf_order_id}`, {
+      headers: {
+        'x-api-version':   '2023-08-01',
+        'x-client-id':     process.env.CASHFREE_APP_ID     || '',
+        'x-client-secret': process.env.CASHFREE_SECRET_KEY || '',
+      },
+    });
+    const cfData = await verifyR.json();
+    console.log('confirm-order: Cashfree status for', cf_order_id, '=', cfData.order_status);
+
+    // Step 2: Only proceed if ACTUALLY PAID
+    if (cfData.order_status !== 'PAID') {
+      console.warn('confirm-order: Payment NOT confirmed. Status:', cfData.order_status, 'Order:', cf_order_id);
+      return res.status(402).json({ 
+        error: 'Payment not confirmed',
+        order_status: cfData.order_status,
+        message: cfData.order_status === 'ACTIVE' 
+          ? 'Payment was not completed. Please try again.'
+          : `Payment status: ${cfData.order_status}`
+      });
+    }
+
+    // Step 3: Check if order already exists (prevent duplicate finalization)
+    const { data: existingOrder } = await supabase
+      .from('orders')
+      .select('id, payment_status')
+      .eq('id', cf_order_id)
+      .single();
+
+    if (existingOrder) {
+      console.log('confirm-order: Order already exists:', cf_order_id, existingOrder.payment_status);
+      return res.json({ 
+        success: true, 
+        duplicate: true,
+        message: 'Order already confirmed',
+        order_id: cf_order_id
+      });
+    }
+
+    // Step 4: Create order with Paid status
+    const order = {
+      ...order_data,
+      id: cf_order_id,
+      payment_status: 'Paid',
+      cf_payment_id: cfData.cf_order_id || cf_order_id,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data, error } = await supabase.from('orders').insert([order]).select().single();
+    if (error) throw error;
+
+    // Step 5: Update customer stats
+    if (order.customer_email) {
+      const { data: existing } = await supabase
+        .from('customers')
+        .select('id,total_orders,total_spent')
+        .eq('email', order.customer_email)
+        .single();
+      const orderTotal = parseFloat(order.total || 0);
+      if (existing) {
+        await supabase.from('customers').update({
+          total_orders: (existing.total_orders || 0) + 1,
+          total_spent: parseFloat(existing.total_spent || 0) + orderTotal,
+          updated_at: new Date().toISOString(),
+        }).eq('id', existing.id);
+      }
+    }
+
+    console.log('✅ confirm-order: Order', cf_order_id, 'finalized successfully');
+    res.json({ success: true, order_id: cf_order_id, data });
+  } catch (err) {
+    console.error('confirm-order error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
