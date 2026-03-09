@@ -1038,9 +1038,32 @@ app.get('/', (_, res) => res.json({
 app.get('/health', (_, res) => res.json({ status:'ok' }));
 
 // ═══════════════════════════════════════════════════════════════
+// KEEP-ALIVE — prevents Render free tier from spinning down
+// Pings itself every 14 minutes (Render sleeps after 15min idle)
+// ═══════════════════════════════════════════════════════════════
+function startKeepAlive() {
+  const SELF_URL = process.env.RENDER_EXTERNAL_URL || `https://ascovita-backend.onrender.com`;
+  const INTERVAL = 14 * 60 * 1000; // 14 minutes
+
+  setInterval(async () => {
+    try {
+      const r = await fetch(`${SELF_URL}/health`, { signal: AbortSignal.timeout(10000) });
+      const now = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' });
+      if (r.ok) console.log(`✅ [KEEP-ALIVE] Pinged at ${now} IST`);
+      else       console.warn(`⚠️ [KEEP-ALIVE] Ping returned ${r.status}`);
+    } catch(e) {
+      console.warn(`⚠️ [KEEP-ALIVE] Ping failed: ${e.message}`);
+    }
+  }, INTERVAL);
+
+  console.log(`✅ Keep-alive started — pinging ${SELF_URL} every 14 min`);
+}
+
+// ═══════════════════════════════════════════════════════════════
 // START
 // ═══════════════════════════════════════════════════════════════
 app.listen(PORT, () => {
   console.log(`✅ Ascovita Backend v7.0 running on port ${PORT}`);
   scheduleReports();
+  startKeepAlive();
 });
