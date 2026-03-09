@@ -532,7 +532,20 @@ app.delete('/api/upload/library/:filename', authMiddleware, async (req, res) => 
 // ═══════════════════════════════════════════════════════════════
 app.get('/api/products', async (req, res) => {
   try {
-    const { data, error } = await supabase.from('products').select('*').eq('active', true).is('deleted_at', null).order('id', { ascending: true });
+    // ✅ FIX 1: No-cache headers — prevents browser/CDN from serving stale products
+    res.set({
+      'Cache-Control': 'no-cache, no-store, must-revalidate',
+      'Pragma':        'no-cache',
+      'Expires':       '0',
+      'Surrogate-Control': 'no-store',
+    });
+    // ✅ FIX 4: Order by created_at DESC so new products appear first on the website
+    const { data, error } = await supabase
+      .from('products')
+      .select('*')
+      .eq('active', true)
+      .is('deleted_at', null)
+      .order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ data: data || [] });
   } catch(err) { res.status(500).json({ error: err.message, data: [] }); }
@@ -540,7 +553,16 @@ app.get('/api/products', async (req, res) => {
 
 app.get('/api/admin/products', authMiddleware, async (req, res) => {
   try {
-    const { data, error } = await supabase.from('products').select('*').order('id', { ascending: true });
+    // ✅ FIX 1: No-cache headers on admin endpoint too
+    res.set({
+      'Cache-Control': 'no-cache, no-store, must-revalidate',
+      'Pragma':        'no-cache',
+      'Expires':       '0',
+    });
+    const { data, error } = await supabase
+      .from('products')
+      .select('*')
+      .order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ data: data || [] });
   } catch(err) { res.status(500).json({ error: err.message, data: [] }); }
@@ -548,6 +570,8 @@ app.get('/api/admin/products', authMiddleware, async (req, res) => {
 
 app.get('/api/products/:id', async (req, res) => {
   try {
+    // ✅ FIX 1: No-cache on single product fetch too
+    res.set({ 'Cache-Control': 'no-cache, no-store, must-revalidate', 'Pragma': 'no-cache', 'Expires': '0' });
     const { data, error } = await supabase.from('products').select('*').eq('id', req.params.id).single();
     if (error) return res.status(404).json({ error: 'Product not found' });
     res.json(data);
@@ -557,8 +581,18 @@ app.get('/api/products/:id', async (req, res) => {
 app.post('/api/products', authMiddleware, async (req, res) => {
   try {
     const b    = req.body;
-    const body = { created_at: new Date().toISOString(), updated_at: new Date().toISOString(), active: b.active !== false };
-    const fields = ['name','brand','category','badge','description','tags','price','sale_price','offer_text','stock','rating','reviews','image','image2','image3','image4','image5','images','key_ingredients','how_to_use','has_tiers','tiers','seo_keywords','meta_description','hsn'];
+    const body = {
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      active:     b.active !== false,   // default true
+      deleted_at: null,                 // ✅ FIX 3: explicitly null so product is always visible
+    };
+    // ✅ FIX 2: Added missing fields: offer, deleted_at
+    const fields = ['name','brand','category','badge','description','tags',
+      'price','sale_price','offer_text','offer','stock','rating','reviews',
+      'image','image2','image3','image4','image5','images',
+      'key_ingredients','how_to_use','has_tiers','tiers',
+      'seo_keywords','meta_description','hsn'];
     fields.forEach(f => { if (b[f] !== undefined) body[f] = b[f]; });
     if ('sale_price' in b) body.sale_price = b.sale_price || null;
     const { data, error } = await supabase.from('products').insert([body]).select().single();
@@ -572,13 +606,22 @@ app.put('/api/products/:id', authMiddleware, async (req, res) => {
   try {
     const b    = req.body;
     const body = { updated_at: new Date().toISOString() };
-    const fields = ['name','brand','category','badge','description','tags','price','sale_price','offer_text','stock','active','rating','reviews','image','image2','image3','image4','image5','images','key_ingredients','how_to_use','has_tiers','tiers','seo_keywords','meta_description','hsn'];
+    // ✅ FIX 2: Added missing fields — offer, deleted_at (for soft delete/restore from this endpoint)
+    const fields = ['name','brand','category','badge','description','tags',
+      'price','sale_price','offer_text','offer','stock','active',
+      'rating','reviews','image','image2','image3','image4','image5','images',
+      'key_ingredients','how_to_use','has_tiers','tiers',
+      'seo_keywords','meta_description','hsn','deleted_at'];
     fields.forEach(f => { if (b[f] !== undefined) body[f] = b[f]; });
     if ('sale_price' in b) body.sale_price = b.sale_price || null;
+    // Allow explicit null for deleted_at (restore operation)
+    if ('deleted_at' in b) body.deleted_at = b.deleted_at || null;
     const { data: old } = await supabase.from('products').select('*').eq('id', req.params.id).single();
     const { data, error } = await supabase.from('products').update(body).eq('id', req.params.id).select().single();
     if (error) throw error;
     await writeAudit({ userId: req.user?.email, tableName: 'products', recordId: req.params.id, action: 'UPDATE', oldValues: old, newValues: body, ipAddress: req.ip });
+    // ✅ FIX 1: No-cache on response so the updated product is immediately visible
+    res.set({ 'Cache-Control': 'no-cache, no-store, must-revalidate', 'Pragma': 'no-cache', 'Expires': '0' });
     res.json(data);
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
