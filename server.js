@@ -63,7 +63,7 @@ const supabase = createClient(
 app.use(cors({
   origin: (origin, cb) => {
     if (!origin) return cb(null, true);
-    const allowed = ['https://ascovita.com','https://www.ascovita.com', process.env.FRONTEND_URL||'','http://localhost:3000','http://localhost:5500','http://127.0.0.1:5500','http://localhost:8080','http://127.0.0.1:8080'];
+    const allowed = ['https://ascovita.com','https://www.ascovita.com', process.env.FRONTEND_URL||'','http://localhost:3000','http://localhost:5500','http://127.0.0.1:5500'];
     if (allowed.some(o => o && origin.startsWith(o)) || origin.includes('ascovita.com') || origin.endsWith('.github.io')) return cb(null, true);
     cb(new Error('CORS: not allowed → ' + origin));
   },
@@ -367,28 +367,9 @@ function scheduleReports() {
 app.post('/api/admin/login', (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
-  
-  const expectedPass = (process.env.ADMIN_PASSWORD || '').trim();
-  const givenPass    = (password || '').trim();
-  const givenUser    = (username || '').trim().toLowerCase();
-  
-  // Debug: log to Render logs (never logs the actual password)
-  console.log(`Login attempt: user="${givenUser}" pass_length=${givenPass.length} env_pass_set=${!!expectedPass} env_pass_length=${expectedPass.length}`);
-  
-  if (!expectedPass) {
-    console.error('ADMIN_PASSWORD env var is not set! Login will always fail.');
-    return res.status(500).json({ error: 'Server misconfigured — ADMIN_PASSWORD not set' });
-  }
-  if (!process.env.JWT_SECRET) {
-    console.error('JWT_SECRET env var is not set! Cannot sign tokens.');
-    return res.status(500).json({ error: 'Server misconfigured — JWT_SECRET not set' });
-  }
-  
-  if (givenUser === 'admin' && givenPass === expectedPass) {
+  if (username === 'admin' && password === process.env.ADMIN_PASSWORD) {
     return res.json({ token: signToken({ role: 'admin', email: 'admin@ascovita.com' }), role: 'admin' });
   }
-  
-  console.log('Login failed: credentials do not match');
   res.status(401).json({ error: 'Invalid credentials' });
 });
 
@@ -712,7 +693,8 @@ app.post('/api/coupons/validate', async (req, res) => {
 // ORDERS — full stored procedure based
 // ═══════════════════════════════════════════════════════════════
 app.get('/api/admin/orders', authMiddleware, async (req, res) => {
-  const { data } = await supabase.from('orders').select('*').order('created_at', { ascending: false });
+  // ✅ FIX: Exclude soft-deleted orders from admin view
+  const { data } = await supabase.from('orders').select('*').is('deleted_at', null).order('created_at', { ascending: false });
   res.json({ data: data || [] });
 });
 
@@ -790,7 +772,7 @@ app.get('/api/orders/:id/history', authMiddleware, async (req, res) => {
 app.get('/api/admin/stats', authMiddleware, async (req, res) => {
   try {
     const [ordersR, prodsR, custsR] = await Promise.all([
-      supabase.from('orders').select('*').order('created_at', { ascending: false }),
+      supabase.from('orders').select('*').is('deleted_at', null).order('created_at', { ascending: false }).limit(1000),
       supabase.from('products').select('id,name,stock,active').eq('active', true).is('deleted_at', null),
       supabase.from('customers').select('id').is('deleted_at', null),
     ]);
@@ -814,7 +796,8 @@ app.get('/api/admin/stats', authMiddleware, async (req, res) => {
 // CUSTOMERS — soft delete + restore
 // ═══════════════════════════════════════════════════════════════
 app.get('/api/admin/customers', authMiddleware, async (req, res) => {
-  const { data } = await supabase.from('customers').select('*').order('created_at', { ascending: false });
+  // ✅ FIX: Exclude soft-deleted customers from admin view
+  const { data } = await supabase.from('customers').select('*').is('deleted_at', null).order('created_at', { ascending: false });
   res.json({ data: data || [] });
 });
 
@@ -880,7 +863,7 @@ app.post('/api/create-cashfree-order', async (req, res) => {
     const payload = {
       order_id, order_amount: parseFloat(amount), order_currency: 'INR',
       customer_details: { customer_id: customer_email.replace(/[^a-zA-Z0-9_-]/g,'_'), customer_name, customer_email, customer_phone: String(customer_phone).replace(/^\+/,'') },
-      order_meta: { return_url: `${process.env.FRONTEND_URL||''}?cf_order=${order_id}`, notify_url: `https://ascovita-backend.onrender.com/api/cashfree-webhook` },
+      order_meta: { return_url: `${process.env.FRONTEND_URL||''}?cf_order=${order_id}`, notify_url: `${process.env.RENDER_EXTERNAL_URL||'https://ascovita-backend.onrender.com'}/api/cashfree-webhook` },
     };
     const r = await fetch(`${CF_BASE}/orders`, { method:'POST', headers:{'Content-Type':'application/json','x-api-version':'2023-08-01','x-client-id':process.env.CASHFREE_APP_ID||'','x-client-secret':process.env.CASHFREE_SECRET_KEY||''}, body:JSON.stringify(payload) });
     const data = await r.json();
@@ -1076,6 +1059,7 @@ function startKeepAlive() {
   }, INTERVAL);
 
   console.log(`✅ Keep-alive started — pinging ${SELF_URL} every 14 min`);
+  console.log(`💡 TIP: Register ${SELF_URL}/health on UptimeRobot.com (free) every 5min — self-pings alone won't prevent Render free-tier cold starts.`);
 }
 
 // ═══════════════════════════════════════════════════════════════
