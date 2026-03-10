@@ -63,7 +63,7 @@ const supabase = createClient(
 app.use(cors({
   origin: (origin, cb) => {
     if (!origin) return cb(null, true);
-    const allowed = ['https://ascovita.com','https://www.ascovita.com', process.env.FRONTEND_URL||'','http://localhost:3000','http://localhost:5500','http://127.0.0.1:5500'];
+    const allowed = ['https://ascovita.com','https://www.ascovita.com', process.env.FRONTEND_URL||'','http://localhost:3000','http://localhost:5500','http://127.0.0.1:5500','http://localhost:8080','http://127.0.0.1:8080'];
     if (allowed.some(o => o && origin.startsWith(o)) || origin.includes('ascovita.com') || origin.endsWith('.github.io')) return cb(null, true);
     cb(new Error('CORS: not allowed → ' + origin));
   },
@@ -367,9 +367,28 @@ function scheduleReports() {
 app.post('/api/admin/login', (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
-  if (username === 'admin' && password === process.env.ADMIN_PASSWORD) {
+  
+  const expectedPass = (process.env.ADMIN_PASSWORD || '').trim();
+  const givenPass    = (password || '').trim();
+  const givenUser    = (username || '').trim().toLowerCase();
+  
+  // Debug: log to Render logs (never logs the actual password)
+  console.log(`Login attempt: user="${givenUser}" pass_length=${givenPass.length} env_pass_set=${!!expectedPass} env_pass_length=${expectedPass.length}`);
+  
+  if (!expectedPass) {
+    console.error('ADMIN_PASSWORD env var is not set! Login will always fail.');
+    return res.status(500).json({ error: 'Server misconfigured — ADMIN_PASSWORD not set' });
+  }
+  if (!process.env.JWT_SECRET) {
+    console.error('JWT_SECRET env var is not set! Cannot sign tokens.');
+    return res.status(500).json({ error: 'Server misconfigured — JWT_SECRET not set' });
+  }
+  
+  if (givenUser === 'admin' && givenPass === expectedPass) {
     return res.json({ token: signToken({ role: 'admin', email: 'admin@ascovita.com' }), role: 'admin' });
   }
+  
+  console.log('Login failed: credentials do not match');
   res.status(401).json({ error: 'Invalid credentials' });
 });
 
