@@ -36,7 +36,7 @@
 //   TWILIO_ACCOUNT_SID        twilio account sid
 //   TWILIO_AUTH_TOKEN         twilio auth token
 //   TWILIO_WHATSAPP_FROM      whatsapp:+14155238886
-//   WHATSAPP_REPORT_TO        whatsapp:+919898582650
+//   WHATSAPP_REPORT_TO        whatsapp:+995597725086
 // ═══════════════════════════════════════════════════════════════════
 
 'use strict';
