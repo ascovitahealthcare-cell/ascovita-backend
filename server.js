@@ -36,7 +36,7 @@
 //   TWILIO_ACCOUNT_SID        twilio account sid
 //   TWILIO_AUTH_TOKEN         twilio auth token
 //   TWILIO_WHATSAPP_FROM      whatsapp:+14155238886
-//   WHATSAPP_REPORT_TO        whatsapp:+995597725086
+//   WHATSAPP_REPORT_TO        whatsapp:+919898582650
 // ═══════════════════════════════════════════════════════════════════
 
 'use strict';
@@ -707,7 +707,7 @@ app.delete('/api/admin/products/:id', authMiddleware, async (req, res) => {
   try {
     const { data: old } = await supabase.from('products').select('*').eq('id', req.params.id).single();
     const { error } = await supabase.from('products').update({
-      active: false, is_active: false,
+      active: false,
       deleted_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     }).eq('id', req.params.id);
@@ -724,7 +724,7 @@ app.delete('/api/admin/products/:id', authMiddleware, async (req, res) => {
 app.put('/api/admin/products/:id/restore', authMiddleware, async (req, res) => {
   try {
     const { error } = await supabase.from('products').update({
-      active: true, is_active: true,
+      active: true,
       deleted_at: null,
       updated_at: new Date().toISOString(),
     }).eq('id', req.params.id);
@@ -1195,6 +1195,60 @@ app.put('/api/settings', authMiddleware, async (req, res) => {
     }
     res.json({ success: true });
   } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// LIVE VISITORS — in-memory session tracking
+// Frontend pings POST /api/visitors/ping every 30s
+// Admin reads GET /api/visitors/active (sessions active in last 2min)
+// ═══════════════════════════════════════════════════════════════
+const visitorSessions = new Map(); // sessionId → { ip, page, ua, lastSeen, firstSeen }
+
+// POST /api/visitors/ping — called by frontend heartbeat
+app.post('/api/visitors/ping', (req, res) => {
+  try {
+    const { session_id, page = '/', referrer = '' } = req.body || {};
+    const id = session_id || req.ip + '-anon';
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
+    const ua = req.headers['user-agent'] || '';
+    const now = Date.now();
+    const existing = visitorSessions.get(id) || {};
+    visitorSessions.set(id, {
+      ip, page, referrer, ua,
+      lastSeen:  now,
+      firstSeen: existing.firstSeen || now,
+    });
+    // Prune sessions older than 2 minutes
+    for (const [k, v] of visitorSessions.entries()) {
+      if (now - v.lastSeen > 2 * 60 * 1000) visitorSessions.delete(k);
+    }
+    res.json({ ok: true });
+  } catch (e) { res.json({ ok: false }); }
+});
+
+// GET /api/visitors/active — used by admin Live Visitors panel
+app.get('/api/visitors/active', authMiddleware, (req, res) => {
+  try {
+    const now = Date.now();
+    const cutoff = now - 2 * 60 * 1000; // last 2 minutes
+    const active = [];
+    for (const [id, v] of visitorSessions.entries()) {
+      if (v.lastSeen >= cutoff) {
+        active.push({
+          session_id:  id,
+          ip:          v.ip,
+          page:        v.page,
+          referrer:    v.referrer || '',
+          user_agent:  v.ua,
+          duration_sec: Math.round((now - v.firstSeen) / 1000),
+          last_seen:   new Date(v.lastSeen).toISOString(),
+        });
+      }
+    }
+    // Sort most-recent first
+    active.sort((a, b) => b.last_seen.localeCompare(a.last_seen));
+    res.json({ count: active.length, data: active });
+  } catch (e) { res.status(500).json({ error: e.message, count: 0, data: [] }); }
 });
 
 // ═══════════════════════════════════════════════════════════════
