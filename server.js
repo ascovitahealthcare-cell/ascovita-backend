@@ -151,9 +151,17 @@ async function sp_place_order(orderData) {
     }
   }
 
+  // 2. Normalise address: frontend sends address_line1/address_line2, schema has 'address'
+  const normalisedOrderData = { ...orderData };
+  if (!normalisedOrderData.address && normalisedOrderData.address_line1) {
+    normalisedOrderData.address = [normalisedOrderData.address_line1, normalisedOrderData.address_line2].filter(Boolean).join(', ');
+  }
+  delete normalisedOrderData.address_line1;
+  delete normalisedOrderData.address_line2;
+
   // 2. Create order
   const { data: order, error } = await supabase.from('orders').insert([{
-    ...orderData,
+    ...normalisedOrderData,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   }]).select().single();
@@ -293,7 +301,7 @@ async function sendOrderEmail(order) {
     </div>
     <div style="margin:16px 36px;background:#f9f9f9;border-radius:10px;padding:16px;font-size:12px;color:#555;line-height:1.7">
       <strong>Delivery to:</strong> ${order.customer_name||''}<br>
-      ${order.address_line1||''} ${order.address_line2||''}, ${order.city||''}, ${order.state||''} - ${order.pincode||''}<br>
+      ${order.address || [order.address_line1, order.address_line2].filter(Boolean).join(', ') || ''}, ${order.city||''}, ${order.state||''} - ${order.pincode||''}<br>
       📞 ${order.customer_phone||''}
     </div>
     <div style="padding:0 36px 28px;text-align:center">
@@ -752,64 +760,6 @@ app.get('/api/products/:id', async (req, res) => {
     const { data, error } = await supabase.from('products').select('*').eq('id', req.params.id).single();
     if (error) return res.status(404).json({ error: 'Product not found' });
     res.json(data);
-  } catch(err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post('/api/products', authMiddleware, async (req, res) => {
-  try {
-    const b    = req.body;
-    const body = {
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-      active:     b.active !== false,   // default true
-      deleted_at: null,                 // ✅ FIX 3: explicitly null so product is always visible
-    };
-    // ✅ FIX 2: Added missing fields: offer, deleted_at
-    const fields = ['name','brand','category','badge','description','tags',
-      'price','sale_price','offer_text','offer','stock','rating','reviews',
-      'image','image2','image3','image4','image5','images',
-      'key_ingredients','how_to_use','has_tiers','tiers',
-      'seo_keywords','meta_description','hsn'];
-    fields.forEach(f => { if (b[f] !== undefined) body[f] = b[f]; });
-    if ('sale_price' in b) body.sale_price = b.sale_price || null;
-    const { data, error } = await supabase.from('products').insert([body]).select().single();
-    if (error) throw error;
-    await writeAudit({ userId: req.user?.email, tableName: 'products', recordId: data.id, action: 'INSERT', newValues: { name: body.name, price: body.price }, ipAddress: req.ip });
-    res.json(data);
-  } catch(err) { res.status(500).json({ error: err.message }); }
-});
-
-app.put('/api/products/:id', authMiddleware, async (req, res) => {
-  try {
-    const b    = req.body;
-    const body = { updated_at: new Date().toISOString() };
-    // ✅ FIX 2: Added missing fields — offer, deleted_at (for soft delete/restore from this endpoint)
-    const fields = ['name','brand','category','badge','description','tags',
-      'price','sale_price','offer_text','offer','stock','active',
-      'rating','reviews','image','image2','image3','image4','image5','images',
-      'key_ingredients','how_to_use','has_tiers','tiers',
-      'seo_keywords','meta_description','hsn','deleted_at'];
-    fields.forEach(f => { if (b[f] !== undefined) body[f] = b[f]; });
-    if ('sale_price' in b) body.sale_price = b.sale_price || null;
-    // Allow explicit null for deleted_at (restore operation)
-    if ('deleted_at' in b) body.deleted_at = b.deleted_at || null;
-    const { data: old } = await supabase.from('products').select('*').eq('id', req.params.id).single();
-    const { data, error } = await supabase.from('products').update(body).eq('id', req.params.id).select().single();
-    if (error) throw error;
-    await writeAudit({ userId: req.user?.email, tableName: 'products', recordId: req.params.id, action: 'UPDATE', oldValues: old, newValues: body, ipAddress: req.ip });
-    // ✅ FIX 1: No-cache on response so the updated product is immediately visible
-    res.set({ 'Cache-Control': 'no-cache, no-store, must-revalidate', 'Pragma': 'no-cache', 'Expires': '0' });
-    res.json(data);
-  } catch(err) { res.status(500).json({ error: err.message }); }
-});
-
-// SOFT DELETE product
-app.delete('/api/products/:id', authMiddleware, async (req, res) => {
-  try {
-    const { data: old } = await supabase.from('products').select('*').eq('id', req.params.id).single();
-    await supabase.from('products').update({ active: false, deleted_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', req.params.id);
-    await writeAudit({ userId: req.user?.email, tableName: 'products', recordId: req.params.id, action: 'SOFT_DELETE', oldValues: old, ipAddress: req.ip });
-    res.json({ success: true });
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1301,8 +1251,7 @@ app.post('/api/confirm-order', async (req, res) => {
           customer_name:  order_data.customer_name,
           customer_email: order_data.customer_email,
           customer_phone: order_data.customer_phone,
-          address_line1:  order_data.address_line1,
-          address_line2:  order_data.address_line2 || '',
+          address: [order_data.address_line1, order_data.address_line2].filter(Boolean).join(', ') || order_data.address || '',
           city:           order_data.city,
           state:          order_data.state,
           pincode:        order_data.pincode,
@@ -1360,6 +1309,80 @@ app.post('/api/confirm-order', async (req, res) => {
 
   } catch(err) {
     console.error('[confirm-order]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /api/confirm-cod-order ───────────────────────────────────────────
+// Dedicated COD order confirmation endpoint.
+// Unlike online payments there is no payment gateway to verify against —
+// we validate the request itself (duplicate check, stock, required fields)
+// then save the order and send confirmation email + admin notification.
+app.post('/api/confirm-cod-order', async (req, res) => {
+  try {
+    const { order_id, order_data } = req.body;
+    if (!order_id)   return res.status(400).json({ error: 'Missing order_id' });
+    if (!order_data) return res.status(400).json({ error: 'Missing order_data' });
+
+    // Validate required fields
+    const required = ['customer_name','customer_email','customer_phone','city','state','pincode','total'];
+    if (!order_data.address && !order_data.address_line1) {
+      return res.status(400).json({ error: 'Missing required field: address' });
+    }
+    if (!order_data.address && order_data.address_line1) {
+      order_data.address = [order_data.address_line1, order_data.address_line2].filter(Boolean).join(', ');
+    }
+    delete order_data.address_line1;
+    delete order_data.address_line2;
+    const missing  = required.filter(f => !order_data[f]);
+    if (missing.length) {
+      return res.status(400).json({ error: `Missing required fields: ${missing.join(', ')}` });
+    }
+
+    // ── 1. Duplicate check — prevent double-submission ─────────────────────
+    const { data: existing } = await supabase
+      .from('orders').select('id, fulfillment').eq('id', order_id).single();
+
+    if (existing) {
+      console.log(`[confirm-cod] Duplicate order ${order_id} — returning existing`);
+      return res.json({ success: true, duplicate: true, order_id });
+    }
+
+    // ── 2. Save order via stored procedure (validates stock, logs audit) ────
+    const orderPayload = {
+      ...order_data,
+      id:             order_id,
+      payment_status: 'COD - Pending',
+      payment_method: 'cod',
+      fulfillment:    'Pending',
+    };
+
+    let savedOrder;
+    try {
+      savedOrder = await sp_place_order(orderPayload);
+    } catch(saveErr) {
+      // Race condition duplicate
+      if (saveErr.code === '23505' || saveErr.message?.includes('duplicate') || saveErr.message?.includes('already exists')) {
+        console.log(`[confirm-cod] Race-condition duplicate ${order_id}`);
+        return res.json({ success: true, duplicate: true, order_id });
+      }
+      // Stock error — surface to customer
+      if (saveErr.message?.includes('stock') || saveErr.message?.includes('Insufficient')) {
+        return res.status(409).json({ error: saveErr.message });
+      }
+      throw saveErr;
+    }
+
+    // ── 3. Send confirmation email ─────────────────────────────────────────
+    await sendOrderEmail(savedOrder).catch(e =>
+      console.warn('[confirm-cod] Email failed:', e.message)
+    );
+
+    console.log(`[confirm-cod] ✅ COD order ${order_id} placed — ₹${order_data.total} — ${order_data.customer_name}`);
+    res.json({ success: true, order_id, data: savedOrder });
+
+  } catch(err) {
+    console.error('[confirm-cod]', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1642,10 +1665,29 @@ app.get('/api/health/shiprocket', authMiddleware, adminOnly, async (req, res) =>
 });
 
 // ═══════════════════════════════════════════════════════════════
+// STARTUP DB CHECK
+// ═══════════════════════════════════════════════════════════════
+async function checkDbTables() {
+  const required = ['products','orders','customers','coupons','order_status_logs','audit_logs','settings','image_library','banners'];
+  const missing = [];
+  for (const t of required) {
+    const { error } = await supabase.from(t).select('id').limit(1);
+    if (error && (error.code === '42P01' || error.message?.includes('does not exist'))) missing.push(t);
+  }
+  if (missing.length) {
+    console.error('\n❌  MISSING DB TABLES:', missing.join(', '));
+    console.error('   → Run schema.sql in Supabase SQL Editor, then redeploy\n');
+  } else {
+    console.log('✅ All database tables verified.');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // START
 // ═══════════════════════════════════════════════════════════════
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`✅ Ascovita Backend v7.0 running on port ${PORT}`);
+  await checkDbTables();
   scheduleReports();
   startKeepAlive();
 });
