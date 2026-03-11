@@ -1070,3 +1070,185 @@ app.listen(PORT, () => {
   scheduleReports();
   startKeepAlive();
 });
+// ═══════════════════════════════════════════════════════
+// ASCOVITA BACKEND — IMAGE UPLOAD FIX
+// Drop this into your server.js / routes file on Render
+// Fixes: "Storage bucket not found" error on image upload
+// ═══════════════════════════════════════════════════════
+//
+// REQUIRED ENV VARIABLES (set in Render → Environment):
+//   SUPABASE_URL         = https://xxxx.supabase.co
+//   SUPABASE_SERVICE_KEY = eyJ... (service_role key, NOT anon key)
+//
+// REQUIRED npm packages (already in most setups):
+//   npm install multer @supabase/supabase-js
+// ═══════════════════════════════════════════════════════
+
+const multer = require('multer');
+const { createClient } = require('@supabase/supabase-js');
+
+const BUCKET_NAME = 'product-images';  // ← must match your Supabase bucket name
+const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+
+// Use memory storage (no temp files on Render's ephemeral filesystem)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_FILE_SIZE },
+  fileFilter: (req, file, cb) => {
+    const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/svg+xml'];
+    if (allowed.includes(file.mimetype)) cb(null, true);
+    else cb(new Error('Only JPG, PNG, WebP, GIF, SVG images are allowed'));
+  }
+});
+
+// Supabase admin client (uses service role key to bypass RLS)
+function getSupabaseAdmin() {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_KEY;
+  if (!url || !key) throw new Error('SUPABASE_URL or SUPABASE_SERVICE_KEY env var missing');
+  return createClient(url, key);
+}
+
+// Auto-create bucket if it doesn't exist
+async function ensureBucket(supabase) {
+  const { data: buckets, error: listErr } = await supabase.storage.listBuckets();
+  if (listErr) throw new Error('Cannot list buckets: ' + listErr.message);
+
+  const exists = buckets.some(b => b.name === BUCKET_NAME);
+  if (exists) return;
+
+  // Create the bucket as public so images can be accessed without auth
+  const { error: createErr } = await supabase.storage.createBucket(BUCKET_NAME, {
+    public: true,
+    allowedMimeTypes: ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/svg+xml'],
+    fileSizeLimit: MAX_FILE_SIZE,
+  });
+  if (createErr) throw new Error('Cannot create bucket "' + BUCKET_NAME + '": ' + createErr.message);
+  console.log(`✅ Created Supabase storage bucket: ${BUCKET_NAME}`);
+}
+
+// ── ROUTE HANDLER ──
+// POST /api/upload/image
+// multipart/form-data with field "image"
+async function uploadImageHandler(req, res) {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No image file provided (field name must be "image")' });
+
+    const supabase = getSupabaseAdmin();
+
+    // Auto-create bucket if missing (solves the "bucket not found" error)
+    await ensureBucket(supabase);
+
+    // Generate unique filename: timestamp + original ext
+    const ext = req.file.originalname.split('.').pop().toLowerCase() || 'jpg';
+    const timestamp = Date.now();
+    const random = Math.random().toString(36).slice(2, 8);
+    const filename = `product-${timestamp}-${random}.${ext}`;
+    const storagePath = `products/${filename}`;
+
+    // Upload to Supabase Storage
+    const { error: uploadErr } = await supabase.storage
+      .from(BUCKET_NAME)
+      .upload(storagePath, req.file.buffer, {
+        contentType: req.file.mimetype,
+        upsert: false,
+      });
+
+    if (uploadErr) throw new Error('Upload to storage failed: ' + uploadErr.message);
+
+    // Get public URL
+    const { data: urlData } = supabase.storage
+      .from(BUCKET_NAME)
+      .getPublicUrl(storagePath);
+
+    const publicUrl = urlData?.publicUrl;
+    if (!publicUrl) throw new Error('Could not get public URL after upload');
+
+    // Optional: save to image_library table in Supabase DB
+    try {
+      await supabase.from('image_library').insert({
+        file_name: filename,
+        storage_path: storagePath,
+        public_url: publicUrl,
+        mime_type: req.file.mimetype,
+        size_bytes: req.file.size,
+        original_name: req.file.originalname,
+      });
+    } catch(dbErr) {
+      // Non-fatal: continue even if DB insert fails
+      console.warn('image_library insert failed (non-fatal):', dbErr.message);
+    }
+
+    res.json({
+      success: true,
+      url: publicUrl,
+      public_url: publicUrl,
+      filename,
+      storage_path: storagePath,
+      size: req.file.size,
+    });
+
+  } catch (err) {
+    console.error('[upload/image] Error:', err.message);
+    res.status(500).json({
+      error: err.message,
+      hint: err.message.includes('bucket') || err.message.includes('not found')
+        ? `Go to Supabase → Storage → Create bucket named "${BUCKET_NAME}" (set as Public)`
+        : 'Check Render logs for details',
+    });
+  }
+}
+
+// GET /api/upload/library — list all uploaded images
+async function listImagesHandler(req, res) {
+  try {
+    const supabase = getSupabaseAdmin();
+    const { data, error } = await supabase
+      .from('image_library')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(200);
+    if (error) throw error;
+    res.json({ success: true, data: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+// DELETE /api/upload/library/:filename
+async function deleteImageHandler(req, res) {
+  try {
+    const { filename } = req.params;
+    if (!filename) return res.status(400).json({ error: 'filename required' });
+
+    const supabase = getSupabaseAdmin();
+    const storagePath = `products/${filename}`;
+
+    const { error: delErr } = await supabase.storage.from(BUCKET_NAME).remove([storagePath]);
+    if (delErr) throw new Error(delErr.message);
+
+    await supabase.from('image_library').delete().eq('file_name', filename);
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+// ═══════════════════════════════════════════════
+// REGISTER ROUTES — add this block to your server.js
+// ═══════════════════════════════════════════════
+/*
+
+const { uploadImageHandler, listImagesHandler, deleteImageHandler, upload } = require('./upload-fix');  // adjust path
+
+// Admin auth middleware (your existing one)
+// const { requireAdmin } = require('./auth');  // uncomment if you have one
+
+app.post('/api/upload/image',  upload.single('image'), uploadImageHandler);
+app.get('/api/upload/library', listImagesHandler);
+app.delete('/api/upload/library/:filename', deleteImageHandler);
+
+*/
+
+module.exports = { upload, uploadImageHandler, listImagesHandler, deleteImageHandler, BUCKET_NAME, ensureBucket };
