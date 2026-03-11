@@ -143,12 +143,16 @@ async function sp_place_order(orderData) {
     }
   }
 
-  // 2. Create order
-  const { data: order, error } = await supabase.from('orders').insert([{
+  // 2. Create order — only include id if explicitly provided (e.g. from Cashfree)
+  const insertPayload = {
     ...orderData,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
-  }]).select().single();
+  };
+  // Remove id if undefined/null so Supabase auto-generates it
+  if (!insertPayload.id) delete insertPayload.id;
+
+  const { data: order, error } = await supabase.from('orders').insert([insertPayload]).select().single();
   if (error) throw error;
 
   // 3. TRIGGER: Decrement stock
@@ -883,7 +887,8 @@ app.get('/api/orders/my', authMiddleware, async (req, res) => {
 app.post('/api/orders', async (req, res) => {
   try {
     const order = await sp_place_order(req.body);
-    await sendOrderEmail(order).catch(() => {});
+    // Send confirmation email — log error but don't fail the response
+    sendOrderEmail(order).catch(e => console.error('[order email]', e.message));
     res.json(order);
   } catch(err) {
     console.error('[ORDER]', err.message);
@@ -946,7 +951,7 @@ app.get('/api/admin/stats', authMiddleware, async (req, res) => {
       supabase.from('customers').select('id').is('deleted_at', null),
     ]);
     const orders = ordersR.data || [], products = prodsR.data || [], customers = custsR.data || [];
-    const today  = new Date().toISOString().split('T')[0];
+    const todayIST = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }); // YYYY-MM-DD
     const paid   = orders.filter(o => o.payment_status === 'Paid');
     res.json({ stats: {
       totalRevenue:   paid.reduce((s, o) => s + parseFloat(o.total || 0), 0),
@@ -954,8 +959,14 @@ app.get('/api/admin/stats', authMiddleware, async (req, res) => {
       totalCustomers: customers.length,
       totalProducts:  products.length,
       pendingOrders:  orders.filter(o => !o.fulfillment || o.fulfillment === 'Pending').length,
-      todayOrders:    orders.filter(o => (o.created_at || '').startsWith(today)).length,
-      todayRevenue:   paid.filter(o => (o.created_at || '').startsWith(today)).reduce((s, o) => s + parseFloat(o.total || 0), 0),
+      todayOrders:    orders.filter(o => {
+        const d = new Date(o.created_at).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        return d === todayIST;
+      }).length,
+      todayRevenue:   paid.filter(o => {
+        const d = new Date(o.created_at).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        return d === todayIST;
+      }).reduce((s, o) => s + parseFloat(o.total || 0), 0),
       lowStockCount:  products.filter(p => p.stock < 20).length,
     }});
   } catch(err) { res.status(500).json({ error: err.message, stats: {} }); }
@@ -1085,9 +1096,13 @@ app.post('/api/confirm-order', async (req, res) => {
     if (existing) return res.json({ success:true, duplicate:true, order_id:cf_order_id });
     const orderPayload = { ...order_data, id:cf_order_id, payment_status:'Paid', cf_payment_id:cfData.cf_order_id||cf_order_id };
     const order = await sp_place_order(orderPayload);
-    await sendOrderEmail(order).catch(() => {});
+    // Send confirmation email — log error but don't fail the response
+    sendOrderEmail(order).catch(e => console.error('[confirm-order email]', e.message));
     res.json({ success:true, order_id:cf_order_id, data:order });
-  } catch(err) { res.status(500).json({ error: err.message }); }
+  } catch(err) {
+    console.error('[confirm-order]', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════
