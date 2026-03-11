@@ -143,16 +143,12 @@ async function sp_place_order(orderData) {
     }
   }
 
-  // 2. Create order — only include id if explicitly provided (e.g. from Cashfree)
-  const insertPayload = {
+  // 2. Create order
+  const { data: order, error } = await supabase.from('orders').insert([{
     ...orderData,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
-  };
-  // Remove id if undefined/null so Supabase auto-generates it
-  if (!insertPayload.id) delete insertPayload.id;
-
-  const { data: order, error } = await supabase.from('orders').insert([insertPayload]).select().single();
+  }]).select().single();
   if (error) throw error;
 
   // 3. TRIGGER: Decrement stock
@@ -565,23 +561,28 @@ app.delete('/api/upload/library/:filename', authMiddleware, async (req, res) => 
 // ═══════════════════════════════════════════════════════════════
 app.get('/api/products', async (req, res) => {
   try {
-    // ✅ FIX 1: No-cache headers — prevents browser/CDN from serving stale products
     res.set({
       'Cache-Control': 'no-cache, no-store, must-revalidate',
       'Pragma':        'no-cache',
       'Expires':       '0',
       'Surrogate-Control': 'no-store',
     });
-    // ✅ FIX 4: Order by created_at DESC so new products appear first on the website
     const { data, error } = await supabase
       .from('products')
       .select('*')
       .eq('active', true)
       .is('deleted_at', null)
       .order('created_at', { ascending: false });
-    if (error) throw error;
+    if (error) {
+      console.error('[GET /api/products]', error.message);
+      // Always return empty array — never a 500 that breaks the frontend
+      return res.json({ data: [], error: error.message });
+    }
     res.json({ data: data || [] });
-  } catch(err) { res.status(500).json({ error: err.message, data: [] }); }
+  } catch(err) {
+    console.error('[GET /api/products]', err.message);
+    res.json({ data: [], error: err.message });
+  }
 });
 
 app.get('/api/admin/products', authMiddleware, async (req, res) => {
@@ -887,8 +888,8 @@ app.get('/api/orders/my', authMiddleware, async (req, res) => {
 app.post('/api/orders', async (req, res) => {
   try {
     const order = await sp_place_order(req.body);
-    // Send confirmation email — log error but don't fail the response
-    sendOrderEmail(order).catch(e => console.error('[order email]', e.message));
+    // Send confirmation email — log error but do not fail
+    sendOrderEmail(order).catch(e => console.error("[order email]", e.message));
     res.json(order);
   } catch(err) {
     console.error('[ORDER]', err.message);
@@ -951,7 +952,7 @@ app.get('/api/admin/stats', authMiddleware, async (req, res) => {
       supabase.from('customers').select('id').is('deleted_at', null),
     ]);
     const orders = ordersR.data || [], products = prodsR.data || [], customers = custsR.data || [];
-    const todayIST = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }); // YYYY-MM-DD
+    const today  = new Date().toISOString().split('T')[0];
     const paid   = orders.filter(o => o.payment_status === 'Paid');
     res.json({ stats: {
       totalRevenue:   paid.reduce((s, o) => s + parseFloat(o.total || 0), 0),
@@ -959,14 +960,8 @@ app.get('/api/admin/stats', authMiddleware, async (req, res) => {
       totalCustomers: customers.length,
       totalProducts:  products.length,
       pendingOrders:  orders.filter(o => !o.fulfillment || o.fulfillment === 'Pending').length,
-      todayOrders:    orders.filter(o => {
-        const d = new Date(o.created_at).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
-        return d === todayIST;
-      }).length,
-      todayRevenue:   paid.filter(o => {
-        const d = new Date(o.created_at).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
-        return d === todayIST;
-      }).reduce((s, o) => s + parseFloat(o.total || 0), 0),
+      todayOrders:    orders.filter(o => (o.created_at || '').startsWith(today)).length,
+      todayRevenue:   paid.filter(o => (o.created_at || '').startsWith(today)).reduce((s, o) => s + parseFloat(o.total || 0), 0),
       lowStockCount:  products.filter(p => p.stock < 20).length,
     }});
   } catch(err) { res.status(500).json({ error: err.message, stats: {} }); }
@@ -1096,13 +1091,10 @@ app.post('/api/confirm-order', async (req, res) => {
     if (existing) return res.json({ success:true, duplicate:true, order_id:cf_order_id });
     const orderPayload = { ...order_data, id:cf_order_id, payment_status:'Paid', cf_payment_id:cfData.cf_order_id||cf_order_id };
     const order = await sp_place_order(orderPayload);
-    // Send confirmation email — log error but don't fail the response
-    sendOrderEmail(order).catch(e => console.error('[confirm-order email]', e.message));
+    // Send confirmation email — log error but do not fail
+    sendOrderEmail(order).catch(e => console.error("[order email]", e.message));
     res.json({ success:true, order_id:cf_order_id, data:order });
-  } catch(err) {
-    console.error('[confirm-order]', err.message);
-    res.status(500).json({ error: err.message });
-  }
+  } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -1287,10 +1279,14 @@ function startKeepAlive() {
 
   setInterval(async () => {
     try {
-      const r = await fetch(`${SELF_URL}/health`, { signal: AbortSignal.timeout(10000) });
+      // Ping health AND products so the products query result is warm in memory
+      const [r1, r2] = await Promise.all([
+        fetch(`${SELF_URL}/health`, { signal: AbortSignal.timeout(10000) }),
+        fetch(`${SELF_URL}/api/products`, { signal: AbortSignal.timeout(10000) }),
+      ]);
       const now = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' });
-      if (r.ok) console.log(`✅ [KEEP-ALIVE] Pinged at ${now} IST`);
-      else       console.warn(`⚠️ [KEEP-ALIVE] Ping returned ${r.status}`);
+      if (r1.ok) console.log(`✅ [KEEP-ALIVE] Pinged at ${now} IST (products: ${r2.status})`);
+      else       console.warn(`⚠️ [KEEP-ALIVE] Health returned ${r1.status}`);
     } catch(e) {
       console.warn(`⚠️ [KEEP-ALIVE] Ping failed: ${e.message}`);
     }
@@ -1298,6 +1294,7 @@ function startKeepAlive() {
 
   console.log(`✅ Keep-alive started — pinging ${SELF_URL} every 14 min`);
   console.log(`💡 TIP: Register ${SELF_URL}/health on UptimeRobot.com (free) every 5min — self-pings alone won't prevent Render free-tier cold starts.`);
+}
 }
 
 
@@ -1357,8 +1354,38 @@ app.get('/api/health/shiprocket', authMiddleware, adminOnly, async (req, res) =>
 // ═══════════════════════════════════════════════════════════════
 // START
 // ═══════════════════════════════════════════════════════════════
-app.listen(PORT, () => {
+// ═══════════════════════════════════════════════════════════════
+// PRODUCT SYNC — admin can force-verify a product is live
+// GET /api/products/sync?id=123 → returns that product's live data
+// Useful to confirm a newly added product is visible on frontend
+// ═══════════════════════════════════════════════════════════════
+app.get('/api/products/sync', authMiddleware, async (req, res) => {
+  try {
+    const id = req.query.id;
+    if (id) {
+      // Check specific product
+      const { data, error } = await supabase.from('products').select('id,name,active,deleted_at,created_at').eq('id', id).single();
+      if (error || !data) return res.json({ visible: false, reason: 'Product not found' });
+      if (!data.active)    return res.json({ visible: false, reason: 'Product is inactive (active=false)', data });
+      if (data.deleted_at) return res.json({ visible: false, reason: 'Product is soft-deleted', data });
+      return res.json({ visible: true, reason: 'Product is live on frontend', data });
+    }
+    // Return count of live products
+    const { data, error } = await supabase.from('products').select('id', { count: 'exact' }).eq('active', true).is('deleted_at', null);
+    if (error) throw error;
+    res.json({ live_product_count: data?.length || 0, ok: true });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+app.listen(PORT, async () => {
   console.log(`✅ Ascovita Backend v7.0 running on port ${PORT}`);
   scheduleReports();
   startKeepAlive();
+  // Warm up Supabase connection on boot so first /api/products call is fast
+  try {
+    await supabase.from('products').select('id').limit(1);
+    console.log('✅ Supabase connection warmed up');
+  } catch(e) {
+    console.warn('⚠️ Supabase warm-up failed:', e.message);
+  }
 });
