@@ -188,7 +188,7 @@ async function sp_place_order(orderData) {
         state: orderData.state || '', pincode: orderData.pincode || '',
         total_orders: 1, total_spent: orderTotal,
         created_at: new Date().toISOString(),
-      }]).catch(() => {});
+      }]);
     }
   }
 
@@ -197,7 +197,7 @@ async function sp_place_order(orderData) {
     order_id: order.id, old_status: null,
     new_status: orderData.fulfillment || 'Pending',
     note: 'Order placed', created_at: new Date().toISOString(),
-  }]).catch(() => {});
+  }]);
 
   // 7. TRIGGER: Audit log
   await writeAudit({ tableName: 'orders', recordId: order.id, action: 'INSERT', newValues: { total: orderData.total, customer_email: orderData.customer_email } });
@@ -228,7 +228,7 @@ async function sp_cancel_order(orderId, reason, cancelledBy) {
   await supabase.from('order_status_logs').insert([{
     order_id: orderId, old_status: order.fulfillment, new_status: 'Cancelled',
     changed_by: cancelledBy, note: reason || 'Cancelled', created_at: new Date().toISOString(),
-  }]).catch(() => {});
+  }]);
   await writeAudit({ tableName: 'orders', recordId: orderId, action: 'UPDATE', oldValues: { fulfillment: order.fulfillment }, newValues: { fulfillment: 'Cancelled' } });
   return { success: true };
 }
@@ -515,7 +515,7 @@ app.post('/api/upload/image', authMiddleware, upload.single('image'), async (req
       mime_type: req.file.mimetype,
       uploaded_by: req.user?.email || 'admin',
       created_at: new Date().toISOString(),
-    }]).catch(() => {});
+  }]);
 
     res.json({ url: publicUrl, public_url: publicUrl, filename: storagePath, success: true });
   } catch(err) {
@@ -764,7 +764,7 @@ app.put('/api/admin/orders/:id', authMiddleware, async (req, res) => {
         order_id: req.params.id, old_status: old.fulfillment, new_status: body.fulfillment,
         changed_by: req.user?.email, note: body.shiprocket_id ? `SR: ${body.shiprocket_id}` : null,
         created_at: new Date().toISOString(),
-      }]).catch(() => {});
+      }]);
     }
     await writeAudit({ userId: req.user?.email, tableName: 'orders', recordId: req.params.id, action: 'UPDATE', oldValues: old, newValues: body, ipAddress: req.ip });
     res.json(data);
