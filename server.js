@@ -51,7 +51,31 @@ const { createClient } = require('@supabase/supabase-js');
 
 const app    = express();
 const PORT   = process.env.PORT || 3000;
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },  // 10MB
+  fileFilter: (req, file, cb) => {
+    const allowed = ['image/jpeg','image/png','image/webp','image/gif','image/svg+xml'];
+    if (allowed.includes(file.mimetype)) cb(null, true);
+    else cb(new Error('Only JPG, PNG, WebP, GIF, SVG images are allowed'));
+  }
+});
+
+const BUCKET_NAME = 'product-images'; // must match your Supabase bucket name
+
+// Auto-create bucket if it doesn't exist (fixes "bucket not found" error)
+async function ensureBucket(sb) {
+  const { data: buckets, error } = await sb.storage.listBuckets();
+  if (error) throw new Error('Cannot list buckets: ' + error.message);
+  if (buckets.some(b => b.name === BUCKET_NAME)) return;
+  const { error: createErr } = await sb.storage.createBucket(BUCKET_NAME, {
+    public: true,
+    allowedMimeTypes: ['image/jpeg','image/png','image/webp','image/gif','image/svg+xml'],
+    fileSizeLimit: 10 * 1024 * 1024,
+  });
+  if (createErr) throw new Error('Cannot create bucket "' + BUCKET_NAME + '": ' + createErr.message);
+  console.log('✅ Created Supabase storage bucket:', BUCKET_NAME);
+}
 
 // ── Supabase ──────────────────────────────────────────────────────
 const supabase = createClient(
@@ -461,40 +485,45 @@ app.post('/api/verify-captcha', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/upload/image', authMiddleware, upload.single('image'), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    if (!req.file) return res.status(400).json({ error: 'No file provided (field name must be "image")' });
 
-    const ext      = req.file.originalname.split('.').pop().toLowerCase();
-    const allowed  = ['jpg','jpeg','png','webp','svg','gif'];
-    if (!allowed.includes(ext)) return res.status(400).json({ error: 'File type not allowed. Use jpg, png, webp, svg' });
+    // Auto-create bucket if missing — fixes "Storage bucket not found" error
+    await ensureBucket(supabase);
 
-    const filename = `products/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+    const ext          = req.file.originalname.split('.').pop().toLowerCase() || 'jpg';
+    const storagePath  = `products/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
 
-    const { data, error } = await supabase.storage
-      .from('products')
-      .upload(filename, req.file.buffer, {
+    const { error: uploadErr } = await supabase.storage
+      .from(BUCKET_NAME)
+      .upload(storagePath, req.file.buffer, {
         contentType: req.file.mimetype,
         upsert: false,
       });
+    if (uploadErr) throw new Error('Upload failed: ' + uploadErr.message);
 
-    if (error) throw error;
+    const { data: urlData } = supabase.storage.from(BUCKET_NAME).getPublicUrl(storagePath);
+    const publicUrl = urlData?.publicUrl;
+    if (!publicUrl) throw new Error('Could not get public URL after upload');
 
-    const { data: urlData } = supabase.storage.from('products').getPublicUrl(filename);
-    const publicUrl = urlData.publicUrl;
-
-    // Save to image library table
+    // Save to image_library table (non-fatal if it fails)
     await supabase.from('image_library').insert([{
-      filename, url: publicUrl,
+      file_name: storagePath.split('/').pop(),
+      storage_path: storagePath,
+      public_url: publicUrl,
       original_name: req.file.originalname,
-      size: req.file.size,
+      size_bytes: req.file.size,
       mime_type: req.file.mimetype,
       uploaded_by: req.user?.email || 'admin',
       created_at: new Date().toISOString(),
     }]).catch(() => {});
 
-    res.json({ url: publicUrl, filename, success: true });
+    res.json({ url: publicUrl, public_url: publicUrl, filename: storagePath, success: true });
   } catch(err) {
     console.error('[UPLOAD]', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({
+      error: err.message,
+      hint: err.message.includes('bucket') ? `Create bucket "${BUCKET_NAME}" in Supabase Storage (set as Public)` : 'Check Render logs',
+    });
   }
 });
 
@@ -1062,6 +1091,60 @@ function startKeepAlive() {
   console.log(`💡 TIP: Register ${SELF_URL}/health on UptimeRobot.com (free) every 5min — self-pings alone won't prevent Render free-tier cold starts.`);
 }
 
+
+// ═══════════════════════════════════════════════════════════════
+// INTEGRATION HEALTH CHECK ROUTES
+// Used by admin panel → Integrations page to verify connectivity
+// Always returns 200 — frontend reads the `status` field
+// ═══════════════════════════════════════════════════════════════
+
+// GET /api/health/cashfree
+app.get('/api/health/cashfree', authMiddleware, adminOnly, async (req, res) => {
+  const appId  = process.env.CASHFREE_APP_ID;
+  const secret = process.env.CASHFREE_SECRET_KEY;
+  const env    = (process.env.CASHFREE_ENV || 'PROD').toUpperCase();
+
+  if (!appId || !secret) {
+    return res.json({ ok: true, status: 'env_missing', detail: 'CASHFREE_APP_ID or CASHFREE_SECRET_KEY not set in Render env vars' });
+  }
+  try {
+    const baseUrl = env === 'PROD' ? 'https://api.cashfree.com/pg' : 'https://sandbox.cashfree.com/pg';
+    const r = await fetch(`${baseUrl}/orders?limit=1`, {
+      headers: { 'x-client-id': appId, 'x-client-secret': secret, 'x-api-version': '2023-08-01', 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(8000),
+    });
+    // 422 = valid credentials but missing/bad params — credentials are valid
+    if (r.ok || r.status === 422) return res.json({ ok: true, status: 'connected', env, detail: 'Credentials valid' });
+    if (r.status === 401)         return res.json({ ok: true, status: 'auth_error', detail: 'Invalid App ID or Secret Key' });
+    return res.json({ ok: true, status: 'error', detail: `Cashfree returned HTTP ${r.status}` });
+  } catch (e) {
+    return res.json({ ok: true, status: 'unreachable', detail: e.message });
+  }
+});
+
+// GET /api/health/shiprocket
+app.get('/api/health/shiprocket', authMiddleware, adminOnly, async (req, res) => {
+  const email    = process.env.SHIPROCKET_EMAIL;
+  const password = process.env.SHIPROCKET_PASSWORD;
+
+  if (!email || !password) {
+    return res.json({ ok: true, status: 'env_missing', detail: 'SHIPROCKET_EMAIL or SHIPROCKET_PASSWORD not set in Render env vars' });
+  }
+  try {
+    const r = await fetch('https://apiv2.shiprocket.in/v1/external/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+      signal: AbortSignal.timeout(8000),
+    });
+    const data = await r.json();
+    if (r.ok && data.token) return res.json({ ok: true, status: 'connected', detail: 'Authenticated successfully' });
+    return res.json({ ok: true, status: 'auth_error', detail: data.message || 'Invalid email or password' });
+  } catch (e) {
+    return res.json({ ok: true, status: 'unreachable', detail: e.message });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════
 // START
 // ═══════════════════════════════════════════════════════════════
@@ -1070,185 +1153,3 @@ app.listen(PORT, () => {
   scheduleReports();
   startKeepAlive();
 });
-// ═══════════════════════════════════════════════════════
-// ASCOVITA BACKEND — IMAGE UPLOAD FIX
-// Drop this into your server.js / routes file on Render
-// Fixes: "Storage bucket not found" error on image upload
-// ═══════════════════════════════════════════════════════
-//
-// REQUIRED ENV VARIABLES (set in Render → Environment):
-//   SUPABASE_URL         = https://xxxx.supabase.co
-//   SUPABASE_SERVICE_KEY = eyJ... (service_role key, NOT anon key)
-//
-// REQUIRED npm packages (already in most setups):
-//   npm install multer @supabase/supabase-js
-// ═══════════════════════════════════════════════════════
-
-const multer = require('multer');
-const { createClient } = require('@supabase/supabase-js');
-
-const BUCKET_NAME = 'product-images';  // ← must match your Supabase bucket name
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
-
-// Use memory storage (no temp files on Render's ephemeral filesystem)
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: MAX_FILE_SIZE },
-  fileFilter: (req, file, cb) => {
-    const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/svg+xml'];
-    if (allowed.includes(file.mimetype)) cb(null, true);
-    else cb(new Error('Only JPG, PNG, WebP, GIF, SVG images are allowed'));
-  }
-});
-
-// Supabase admin client (uses service role key to bypass RLS)
-function getSupabaseAdmin() {
-  const url = process.env.SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_KEY;
-  if (!url || !key) throw new Error('SUPABASE_URL or SUPABASE_SERVICE_KEY env var missing');
-  return createClient(url, key);
-}
-
-// Auto-create bucket if it doesn't exist
-async function ensureBucket(supabase) {
-  const { data: buckets, error: listErr } = await supabase.storage.listBuckets();
-  if (listErr) throw new Error('Cannot list buckets: ' + listErr.message);
-
-  const exists = buckets.some(b => b.name === BUCKET_NAME);
-  if (exists) return;
-
-  // Create the bucket as public so images can be accessed without auth
-  const { error: createErr } = await supabase.storage.createBucket(BUCKET_NAME, {
-    public: true,
-    allowedMimeTypes: ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/svg+xml'],
-    fileSizeLimit: MAX_FILE_SIZE,
-  });
-  if (createErr) throw new Error('Cannot create bucket "' + BUCKET_NAME + '": ' + createErr.message);
-  console.log(`✅ Created Supabase storage bucket: ${BUCKET_NAME}`);
-}
-
-// ── ROUTE HANDLER ──
-// POST /api/upload/image
-// multipart/form-data with field "image"
-async function uploadImageHandler(req, res) {
-  try {
-    if (!req.file) return res.status(400).json({ error: 'No image file provided (field name must be "image")' });
-
-    const supabase = getSupabaseAdmin();
-
-    // Auto-create bucket if missing (solves the "bucket not found" error)
-    await ensureBucket(supabase);
-
-    // Generate unique filename: timestamp + original ext
-    const ext = req.file.originalname.split('.').pop().toLowerCase() || 'jpg';
-    const timestamp = Date.now();
-    const random = Math.random().toString(36).slice(2, 8);
-    const filename = `product-${timestamp}-${random}.${ext}`;
-    const storagePath = `products/${filename}`;
-
-    // Upload to Supabase Storage
-    const { error: uploadErr } = await supabase.storage
-      .from(BUCKET_NAME)
-      .upload(storagePath, req.file.buffer, {
-        contentType: req.file.mimetype,
-        upsert: false,
-      });
-
-    if (uploadErr) throw new Error('Upload to storage failed: ' + uploadErr.message);
-
-    // Get public URL
-    const { data: urlData } = supabase.storage
-      .from(BUCKET_NAME)
-      .getPublicUrl(storagePath);
-
-    const publicUrl = urlData?.publicUrl;
-    if (!publicUrl) throw new Error('Could not get public URL after upload');
-
-    // Optional: save to image_library table in Supabase DB
-    try {
-      await supabase.from('image_library').insert({
-        file_name: filename,
-        storage_path: storagePath,
-        public_url: publicUrl,
-        mime_type: req.file.mimetype,
-        size_bytes: req.file.size,
-        original_name: req.file.originalname,
-      });
-    } catch(dbErr) {
-      // Non-fatal: continue even if DB insert fails
-      console.warn('image_library insert failed (non-fatal):', dbErr.message);
-    }
-
-    res.json({
-      success: true,
-      url: publicUrl,
-      public_url: publicUrl,
-      filename,
-      storage_path: storagePath,
-      size: req.file.size,
-    });
-
-  } catch (err) {
-    console.error('[upload/image] Error:', err.message);
-    res.status(500).json({
-      error: err.message,
-      hint: err.message.includes('bucket') || err.message.includes('not found')
-        ? `Go to Supabase → Storage → Create bucket named "${BUCKET_NAME}" (set as Public)`
-        : 'Check Render logs for details',
-    });
-  }
-}
-
-// GET /api/upload/library — list all uploaded images
-async function listImagesHandler(req, res) {
-  try {
-    const supabase = getSupabaseAdmin();
-    const { data, error } = await supabase
-      .from('image_library')
-      .select('*')
-      .order('created_at', { ascending: false })
-      .limit(200);
-    if (error) throw error;
-    res.json({ success: true, data: data || [] });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-}
-
-// DELETE /api/upload/library/:filename
-async function deleteImageHandler(req, res) {
-  try {
-    const { filename } = req.params;
-    if (!filename) return res.status(400).json({ error: 'filename required' });
-
-    const supabase = getSupabaseAdmin();
-    const storagePath = `products/${filename}`;
-
-    const { error: delErr } = await supabase.storage.from(BUCKET_NAME).remove([storagePath]);
-    if (delErr) throw new Error(delErr.message);
-
-    await supabase.from('image_library').delete().eq('file_name', filename);
-
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-}
-
-// ═══════════════════════════════════════════════
-// REGISTER ROUTES — add this block to your server.js
-// ═══════════════════════════════════════════════
-/*
-
-const { uploadImageHandler, listImagesHandler, deleteImageHandler, upload } = require('./upload-fix');  // adjust path
-
-// Admin auth middleware (your existing one)
-// const { requireAdmin } = require('./auth');  // uncomment if you have one
-
-app.post('/api/upload/image',  upload.single('image'), uploadImageHandler);
-app.get('/api/upload/library', listImagesHandler);
-app.delete('/api/upload/library/:filename', deleteImageHandler);
-
-*/
-
-module.exports = { upload, uploadImageHandler, listImagesHandler, deleteImageHandler, BUCKET_NAME, ensureBucket };
