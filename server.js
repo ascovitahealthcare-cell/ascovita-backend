@@ -597,6 +597,121 @@ app.get('/api/admin/products', authMiddleware, async (req, res) => {
   } catch(err) { res.status(500).json({ error: err.message, data: [] }); }
 });
 
+// ── /api/admin/products — POST (create) ──────────────────────────
+// Admin frontend calls /api/admin/products, not /api/products
+app.post('/api/admin/products', authMiddleware, async (req, res) => {
+  try {
+    const b = req.body;
+    const body = {
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      active:     b.is_active !== undefined ? b.is_active : (b.active !== false),
+      is_active:  b.is_active !== undefined ? b.is_active : (b.active !== false),
+      deleted_at: null,
+    };
+    const fields = [
+      'name','brand','category','badge','description','tags',
+      'mrp','price','sale_price','offer_text','stock','rating','reviews',
+      'image','image2','image3','image4','image5','images','media',
+      'key_ingredients','how_to_use','has_tiers','tiers',
+      'seo_title','seo_keywords','meta_description','hsn',
+    ];
+    fields.forEach(f => { if (b[f] !== undefined) body[f] = b[f]; });
+    // mrp / price aliasing — store as both so queries work either way
+    if (!body.mrp  && body.price) body.mrp   = body.price;
+    if (!body.price && body.mrp)  body.price  = body.mrp;
+    if ('sale_price' in b) body.sale_price = b.sale_price || null;
+    // Stringify arrays/objects for DB if needed
+    ['tags','key_ingredients','seo_keywords','media','tiers'].forEach(f => {
+      if (body[f] !== undefined && typeof body[f] !== 'string') {
+        body[f] = JSON.stringify(body[f]);
+      }
+    });
+    const { data, error } = await supabase.from('products').insert([body]).select().single();
+    if (error) throw error;
+    await writeAudit({ userId: req.user?.email, tableName: 'products', recordId: data.id, action: 'INSERT', newValues: { name: body.name }, ipAddress: req.ip });
+    res.set({ 'Cache-Control': 'no-cache, no-store, must-revalidate' });
+    res.json(data);
+  } catch(err) {
+    console.error('[POST /api/admin/products]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── /api/admin/products/:id — PUT (update) ────────────────────────
+app.put('/api/admin/products/:id', authMiddleware, async (req, res) => {
+  try {
+    const b = req.body;
+    const body = { updated_at: new Date().toISOString() };
+    const fields = [
+      'name','brand','category','badge','description','tags',
+      'mrp','price','sale_price','offer_text','stock','active','is_active',
+      'rating','reviews','image','image2','image3','image4','image5','images','media',
+      'key_ingredients','how_to_use','has_tiers','tiers',
+      'seo_title','seo_keywords','meta_description','hsn','deleted_at',
+    ];
+    fields.forEach(f => { if (b[f] !== undefined) body[f] = b[f]; });
+    // Sync active / is_active
+    if (b.is_active !== undefined) body.active    = b.is_active;
+    if (b.active    !== undefined) body.is_active = b.active;
+    // Sync mrp / price
+    if (b.mrp   && !b.price) body.price = b.mrp;
+    if (b.price && !b.mrp)   body.mrp   = b.price;
+    if ('sale_price' in b) body.sale_price = b.sale_price || null;
+    if ('deleted_at' in b) body.deleted_at = b.deleted_at || null;
+    // Stringify arrays/objects for DB if needed
+    ['tags','key_ingredients','seo_keywords','media','tiers'].forEach(f => {
+      if (body[f] !== undefined && typeof body[f] !== 'string') {
+        body[f] = JSON.stringify(body[f]);
+      }
+    });
+    const { data: old } = await supabase.from('products').select('*').eq('id', req.params.id).single();
+    const { data, error } = await supabase.from('products').update(body).eq('id', req.params.id).select().single();
+    if (error) throw error;
+    await writeAudit({ userId: req.user?.email, tableName: 'products', recordId: req.params.id, action: 'UPDATE', oldValues: old, newValues: body, ipAddress: req.ip });
+    res.set({ 'Cache-Control': 'no-cache, no-store, must-revalidate', 'Pragma': 'no-cache', 'Expires': '0' });
+    res.json(data);
+  } catch(err) {
+    console.error('[PUT /api/admin/products/:id]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── /api/admin/products/:id — DELETE (soft) ───────────────────────
+app.delete('/api/admin/products/:id', authMiddleware, async (req, res) => {
+  try {
+    const { data: old } = await supabase.from('products').select('*').eq('id', req.params.id).single();
+    const { error } = await supabase.from('products').update({
+      active: false, is_active: false,
+      deleted_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }).eq('id', req.params.id);
+    if (error) throw error;
+    await writeAudit({ userId: req.user?.email, tableName: 'products', recordId: req.params.id, action: 'SOFT_DELETE', oldValues: old, ipAddress: req.ip });
+    res.json({ success: true });
+  } catch(err) {
+    console.error('[DELETE /api/admin/products/:id]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── /api/admin/products/:id/restore — PUT ─────────────────────────
+app.put('/api/admin/products/:id/restore', authMiddleware, async (req, res) => {
+  try {
+    const { error } = await supabase.from('products').update({
+      active: true, is_active: true,
+      deleted_at: null,
+      updated_at: new Date().toISOString(),
+    }).eq('id', req.params.id);
+    if (error) throw error;
+    await writeAudit({ userId: req.user?.email, tableName: 'products', recordId: req.params.id, action: 'RESTORE', ipAddress: req.ip });
+    res.json({ success: true });
+  } catch(err) {
+    console.error('[PUT /api/admin/products/:id/restore]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/products/:id', async (req, res) => {
   try {
     // ✅ FIX 1: No-cache on single product fetch too
