@@ -952,16 +952,18 @@ app.get('/api/admin/stats', authMiddleware, async (req, res) => {
       supabase.from('customers').select('id').is('deleted_at', null),
     ]);
     const orders = ordersR.data || [], products = prodsR.data || [], customers = custsR.data || [];
-    const today  = new Date().toISOString().split('T')[0];
+    // ✅ FIX: Use IST date so orders placed 12am–5:30am IST are counted correctly
+    const today  = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }); // YYYY-MM-DD in IST
     const paid   = orders.filter(o => o.payment_status === 'Paid');
+    const toISTDate = (iso) => iso ? new Date(iso).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }) : '';
     res.json({ stats: {
       totalRevenue:   paid.reduce((s, o) => s + parseFloat(o.total || 0), 0),
       totalOrders:    orders.length,
       totalCustomers: customers.length,
       totalProducts:  products.length,
       pendingOrders:  orders.filter(o => !o.fulfillment || o.fulfillment === 'Pending').length,
-      todayOrders:    orders.filter(o => (o.created_at || '').startsWith(today)).length,
-      todayRevenue:   paid.filter(o => (o.created_at || '').startsWith(today)).reduce((s, o) => s + parseFloat(o.total || 0), 0),
+      todayOrders:    orders.filter(o => toISTDate(o.created_at) === today).length,
+      todayRevenue:   paid.filter(o => toISTDate(o.created_at) === today).reduce((s, o) => s + parseFloat(o.total || 0), 0),
       lowStockCount:  products.filter(p => p.stock < 20).length,
     }});
   } catch(err) { res.status(500).json({ error: err.message, stats: {} }); }
@@ -1195,7 +1197,25 @@ app.get('/api/settings', async (req, res) => {
   res.json(obj);
 });
 
+// ✅ Admin alias — admin panel calls /api/admin/settings (authenticated)
+app.get('/api/admin/settings', authMiddleware, async (req, res) => {
+  const { data } = await supabase.from('settings').select('*');
+  const obj = {};
+  (data||[]).forEach(s => { obj[s.key] = s.value; });
+  res.json(obj);
+});
+
 app.put('/api/settings', authMiddleware, async (req, res) => {
+  try {
+    for (const [key, value] of Object.entries(req.body)) {
+      await supabase.from('settings').upsert({ key, value, updated_at: new Date().toISOString() });
+    }
+    res.json({ success: true });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// Admin alias for PUT
+app.put('/api/admin/settings', authMiddleware, async (req, res) => {
   try {
     for (const [key, value] of Object.entries(req.body)) {
       await supabase.from('settings').upsert({ key, value, updated_at: new Date().toISOString() });
@@ -1294,7 +1314,6 @@ function startKeepAlive() {
 
   console.log(`✅ Keep-alive started — pinging ${SELF_URL} every 14 min`);
   console.log(`💡 TIP: Register ${SELF_URL}/health on UptimeRobot.com (free) every 5min — self-pings alone won't prevent Render free-tier cold starts.`);
-}
 }
 
 
